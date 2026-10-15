@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.1.0
-// @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and a PDF reader. Alt+T toggles reading mode.
+// @version      1.2.0
+// @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, a PDF reader and a pasted-text reader. Alt+T toggles reading mode.
 // @author       inferior321
 // @license      MIT
 // @homepageURL  https://github.com/inferior321/lector
@@ -32,7 +32,8 @@
 
   // ---------- menu (registered first so it shows up even if a page breaks the UI code) ----------
   GM_registerMenuCommand('Toggle reading mode (Alt+T)', () => setEnabled(!enabled));
-  GM_registerMenuCommand('Open a PDF to read…', () => (isReaderTab ? openPdfReader() : openReaderTab()));
+  GM_registerMenuCommand('Open a PDF to read…', () => (isReaderTab ? openPdfReader() : openReaderTab(READER_URL)));
+  GM_registerMenuCommand('Read pasted text…', () => (isTextTab ? openTextReader() : openReaderTab(TEXT_READER_URL)));
   GM_registerMenuCommand('Swap direction (Spanish ⇄ English)', () => {
     GM_setValue('reversed', !cfg.reversed);
     hideTip();
@@ -577,13 +578,13 @@
       .dict { display: block; margin-top: 6px; text-align: right; font-size: 11px; color: #8fb4ff;
         text-decoration: none; }
       .dict:hover { text-decoration: underline; }
-      .pdfbar { position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 1;
+      .readerbar { position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 1;
         background: #1f2430; color: #f2f2f2; font: 13px system-ui, sans-serif; padding: 5px 10px;
         border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
-      .pdfstatus { display: flex; align-items: center; gap: 6px; }
-      .pdfbar button { all: unset; cursor: pointer; padding: 1px 9px; border-radius: 5px; background: #343b4b; }
-      .pdfbar button:hover { background: #46506a; }
-      .pdfbar input { width: 3.2em; background: #2a3040; color: #f2f2f2; border: 1px solid #46506a;
+      .readerstatus { display: flex; align-items: center; gap: 6px; }
+      .readerbar button { all: unset; cursor: pointer; padding: 1px 9px; border-radius: 5px; background: #343b4b; }
+      .readerbar button:hover { background: #46506a; }
+      .readerbar input { width: 3.2em; background: #2a3040; color: #f2f2f2; border: 1px solid #46506a;
         border-radius: 4px; padding: 1px 4px; font: inherit; }
       .pdfzoom { min-width: 3.2em; text-align: center; }
       .pdfsep { width: 10px; }
@@ -966,14 +967,44 @@
   const READER_URL = 'https://example.com/#lector-pdf';
   const isReaderTab = location.hostname === 'example.com' && location.hash === '#lector-pdf';
   const PDF_ZOOM_STEP = 1.15;
+  // Last page read in each PDF (by file name + size), newest last; the oldest are dropped.
+  const PDF_PAGES_KEY = 'pdfPages';
+  const MAX_PDF_PAGES = 50;
 
   // A normal browser tab: the file picker doesn't open in tabs made by Tampermonkey's
   // GM_openInTab, so don't switch to that.
-  function openReaderTab() {
-    if (!window.open(READER_URL, '_blank')) location.href = READER_URL; // popup blocked: use this tab
+  function openReaderTab(url) {
+    if (!window.open(url, '_blank')) location.href = url; // popup blocked: use this tab
   }
+
+  // The tab becomes a reader: drop the page's content and styles (not ours).
+  function takeOverPage(title, css, background) {
+    for (const n of [...document.body.childNodes]) if (n !== host) n.remove();
+    document.querySelectorAll('style, link[rel~="stylesheet"]').forEach((n) => n !== pageStyle && n.remove());
+    document.documentElement.style.cssText = 'height:auto;overflow:auto;';
+    document.body.style.cssText = `margin:0;height:auto;overflow:auto;background:${background};`;
+    document.title = title;
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.append(style);
+    window.scrollTo(0, 0);
+  }
+
+  function savedPdfPage(key) {
+    return GM_getValue(PDF_PAGES_KEY, {})[key] || 1;
+  }
+
+  function savePdfPage(key, page) {
+    const all = GM_getValue(PDF_PAGES_KEY, {});
+    delete all[key];
+    all[key] = page;
+    const keys = Object.keys(all);
+    for (const k of keys.slice(0, keys.length - MAX_PDF_PAGES)) delete all[k];
+    GM_setValue(PDF_PAGES_KEY, all);
+  }
+
   let pdfjs = null;
-  let pdfReader = null; // { doc, scale, pages: [{ div, rendered }], observer }
+  let pdfReader = null; // { doc, scale, pages: [{ div, rendered }], observer, fileKey }
 
   async function openPdfReader() {
     if (pdfReader) return;
@@ -994,18 +1025,10 @@
       return;
     }
 
-    // The tab becomes the reader: drop the page's content and styles (not ours).
-    for (const n of [...document.body.childNodes]) if (n !== host) n.remove();
-    document.querySelectorAll('style, link[rel~="stylesheet"]').forEach((n) => n !== pageStyle && n.remove());
-    document.documentElement.style.cssText = 'height:auto;overflow:auto;';
-    document.body.style.cssText = 'margin:0;height:auto;overflow:auto;background:#525659;';
-    document.title = file.name;
-    const style = document.createElement('style');
-    style.textContent = PDF_PAGE_CSS;
-    document.head.append(style);
+    pdfReader.fileKey = `${file.name}|${file.size}`;
+    takeOverPage(file.name, PDF_PAGE_CSS, '#525659');
     const container = el('div', 'lector-pdf');
     document.body.prepend(container);
-    window.scrollTo(0, 0);
 
     const first = await pdfReader.doc.getPage(1);
     const width = first.getViewport({ scale: 1 }).width;
@@ -1020,6 +1043,7 @@
       for (const entry of entries) if (entry.isIntersecting) renderPdfPage(+entry.target.dataset.page);
     }, { rootMargin: '1200px 0px' });
     await layoutPdfPages();
+    goToPdfPage(savedPdfPage(pdfReader.fileKey)); // carry on where you left off
     bar.ready(pdfReader.doc.numPages);
     setEnabled(true);
   }
@@ -1175,11 +1199,17 @@
 
   // Floating toolbar (inside our shadow root, so its labels aren't translatable words):
   //   [−] 110% [+]   Page [ 3 ] / 12
-  function pdfToolbar() {
-    const bar = el('div', 'pdfbar');
-    const status = el('span', 'pdfstatus');
+  // Floating bar at the top of a reader tab (PDF or pasted text).
+  function readerBar() {
+    const bar = el('div', 'readerbar');
+    const status = el('span', 'readerstatus');
     bar.append(status);
     shadow.append(bar);
+    return { el: bar, status };
+  }
+
+  function pdfToolbar() {
+    const { el: bar, status } = readerBar();
     return {
       el: bar,
       status,
@@ -1201,12 +1231,18 @@
           (e.key === '-' ? zoomOut : zoomIn).click();
         }, true);
         let queued = false;
+        let lastPage = currentPdfPage();
         window.addEventListener('scroll', () => {
           if (queued) return;
           queued = true;
-          requestAnimationFrame(() => { queued = false; if (shadow.activeElement !== pageInput) pageInput.value = currentPdfPage(); });
+          requestAnimationFrame(() => {
+            queued = false;
+            const page = currentPdfPage();
+            if (shadow.activeElement !== pageInput) pageInput.value = page;
+            if (page !== lastPage) savePdfPage(pdfReader.fileKey, (lastPage = page));
+          });
         }, { passive: true });
-        pageInput.value = 1;
+        pageInput.value = lastPage;
         showZoom();
         status.replaceChildren(zoomOut, zoomLabel, zoomIn, el('span', 'pdfsep'), 'Page ', pageInput, ` / ${total}`);
       },
@@ -1222,6 +1258,51 @@
       transform-origin: 0 0; z-index: 2; }
     .textLayer span { position: absolute; white-space: pre; transform-origin: 0% 0%; cursor: text; color: transparent; }
     .textLayer ::selection { background: rgba(149, 102, 230, .35); }`;
+
+  // ---------- text reader ----------
+  // "Read pasted text…" opens a tab on example.com (like the PDF reader) with a box to paste
+  // any text into; it's then shown as plain paragraphs with the usual click-to-translate.
+  const TEXT_READER_URL = 'https://example.com/#lector-text';
+  const isTextTab = location.hostname === 'example.com' && location.hash === '#lector-text';
+  let textBar = null;
+
+  function openTextReader() {
+    setEnabled(false);
+    takeOverPage('Lector: pasted text', TEXT_PAGE_CSS, '#faf8f4');
+    const container = el('div', 'lector-text');
+    const box = el('textarea', 'lector-paste');
+    box.placeholder = 'Paste the text you want to read here…';
+    container.append(box);
+    document.body.prepend(container);
+    box.focus();
+
+    textBar?.el.remove();
+    textBar = readerBar();
+    const read = el('button', null, 'Read');
+    textBar.status.replaceChildren('Paste text below, then', read);
+    read.onclick = () => {
+      const paragraphs = textParagraphs(box.value);
+      if (!paragraphs.length) { box.focus(); return; }
+      container.replaceChildren(...paragraphs.map((p) => el('p', null, p)));
+      const again = el('button', null, 'Paste new text');
+      again.onclick = openTextReader;
+      textBar.status.replaceChildren(again);
+      setEnabled(true);
+    };
+  }
+
+  // Blank lines separate paragraphs (lines inside one are joined back up). Text without any
+  // blank lines is read one line per paragraph.
+  function textParagraphs(text) {
+    const blocks = /\n\s*\n/.test(text) ? text.split(/\n\s*\n/).map((b) => b.replace(/\s*\n\s*/g, ' ')) : text.split('\n');
+    return blocks.map((b) => b.trim()).filter(Boolean);
+  }
+
+  const TEXT_PAGE_CSS = `
+    .lector-text { max-width: 40em; margin: 0 auto; padding: 64px 24px 48px; font: 20px/1.6 Georgia, serif; color: #222; }
+    .lector-text p { margin: 0 0 1em; }
+    .lector-paste { width: 100%; height: 60vh; box-sizing: border-box; padding: 12px; resize: vertical;
+      font: 16px/1.5 system-ui, sans-serif; border: 1px solid #ccc; border-radius: 8px; background: #fff; }`;
 
   // ---------- events ----------
   function isEditable(t) {
@@ -1347,4 +1428,5 @@
 
   setEnabled(enabled);
   if (isReaderTab) openPdfReader();
+  if (isTextTab) openTextReader();
 })();

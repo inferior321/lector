@@ -1,6 +1,6 @@
 # Lector
 
-A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and a PDF reader.
+A reading assistant for Spanish learners: in-context translations, phrase detection, audio, a PDF reader and a pasted-text reader.
 
 Lector is a userscript. Turn on reading mode on any web page, click a word (or drag across a phrase), and a popup shows what it means **in that sentence**, not just in the dictionary.
 
@@ -21,7 +21,8 @@ Tampermonkey checks this address for new versions and updates the script by itse
 | **Drag across words** | Translate a phrase (the selection snaps to whole words) |
 | **Esc** | Close the popup |
 | | Words and phrases you've looked up get a dotted purple underline everywhere they appear on the page, until you reload (shown only in reading mode) |
-| Tampermonkey menu → **Open a PDF to read…** | Opens a reader tab: pick a PDF and read it with the same click-to-translate |
+| Tampermonkey menu → **Open a PDF to read…** | Opens a reader tab: pick a PDF and read it with the same click-to-translate. It reopens each PDF at the page where you left off |
+| Tampermonkey menu → **Read pasted text…** | Opens a reader tab: paste any text (an email, a message, a site where clicking doesn't work) and read it with click-to-translate |
 | Tampermonkey menu → **Swap direction** | Spanish → English (default) or English → Spanish |
 
 ### The popup
@@ -56,7 +57,7 @@ Google translates whole sentences, so Lector works out which part of the transla
 - **Privacy:** each lookup sends the sentence around the word to Google Translate. Keep reading mode off on private pages (email, banking).
 - Lector uses Google Translate's free, unofficial web addresses. Google may limit heavy use for a few minutes. Lector then switches to a second address, and the corner badge turns amber with a countdown if both are busy.
 - Translations are cached in Tampermonkey's storage, so repeat lookups are instant.
-- The PDF reader uses [PDF.js](https://mozilla.github.io/pdf.js/) (downloaded once from cdnjs and cached) and runs on `example.com`, a plain page that doesn't block it.
+- The PDF and text readers run on `example.com`, a plain page that doesn't block them. The PDF reader uses [PDF.js](https://mozilla.github.io/pdf.js/) (downloaded once from cdnjs and cached).
 - Doesn't work inside embedded frames, on text drawn as images (e.g. Google Docs) or in scanned PDFs.
 
 ## License
