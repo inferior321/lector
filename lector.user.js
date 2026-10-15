@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.2.0
+// @version      1.3.0
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, a PDF reader and a pasted-text reader. Alt+T toggles reading mode.
 // @author       inferior321
 // @license      MIT
@@ -1260,35 +1260,43 @@
     .textLayer ::selection { background: rgba(149, 102, 230, .35); }`;
 
   // ---------- text reader ----------
-  // "Read pasted text…" opens a tab on example.com (like the PDF reader) with a box to paste
-  // any text into; it's then shown as plain paragraphs with the usual click-to-translate.
+  // "Read pasted text…" opens a tab on example.com (like the PDF reader). Pasting anywhere in
+  // it (Ctrl+V or right-click → Paste) shows the text as plain paragraphs with the usual
+  // click-to-translate; a new paste replaces it. The text is kept in the tab's sessionStorage,
+  // so reloading brings it back and closing the tab forgets it.
   const TEXT_READER_URL = 'https://example.com/#lector-text';
   const isTextTab = location.hostname === 'example.com' && location.hash === '#lector-text';
-  let textBar = null;
+  const TEXT_STORE_KEY = 'lector-text';
+  let textReader = null; // { container, bar }
 
   function openTextReader() {
-    setEnabled(false);
-    takeOverPage('Lector: pasted text', TEXT_PAGE_CSS, '#faf8f4');
-    const container = el('div', 'lector-text');
-    const box = el('textarea', 'lector-paste');
-    box.placeholder = 'Paste the text you want to read here…';
-    container.append(box);
-    document.body.prepend(container);
-    box.focus();
+    if (!textReader) {
+      takeOverPage('Lector: pasted text', TEXT_PAGE_CSS, '#faf8f4');
+      textReader = { container: el('div', 'lector-text'), bar: readerBar() };
+      textReader.bar.status.textContent = 'Ctrl+V replaces the text';
+      document.body.prepend(textReader.container);
+      document.addEventListener('paste', (e) => {
+        const text = e.clipboardData?.getData('text/plain') || '';
+        if (!text.trim()) return;
+        e.preventDefault();
+        try { sessionStorage.setItem(TEXT_STORE_KEY, text); } catch { /* storage blocked: just don't keep it */ }
+        showPastedText(text);
+      });
+    }
+    let saved = '';
+    try { saved = sessionStorage.getItem(TEXT_STORE_KEY) || ''; } catch { /* storage blocked */ }
+    showPastedText(saved);
+  }
 
-    textBar?.el.remove();
-    textBar = readerBar();
-    const read = el('button', null, 'Read');
-    textBar.status.replaceChildren('Paste text below, then', read);
-    read.onclick = () => {
-      const paragraphs = textParagraphs(box.value);
-      if (!paragraphs.length) { box.focus(); return; }
-      container.replaceChildren(...paragraphs.map((p) => el('p', null, p)));
-      const again = el('button', null, 'Paste new text');
-      again.onclick = openTextReader;
-      textBar.status.replaceChildren(again);
-      setEnabled(true);
-    };
+  function showPastedText(text) {
+    const paragraphs = textParagraphs(text);
+    hideTip();
+    textReader.container.replaceChildren(...(paragraphs.length
+      ? paragraphs.map((p) => el('p', null, p))
+      : [el('div', 'lector-hint', 'Press Ctrl+V to paste the text you want to read')]));
+    textReader.bar.el.style.display = paragraphs.length ? '' : 'none';
+    window.scrollTo(0, 0);
+    setEnabled(paragraphs.length > 0);
   }
 
   // Blank lines separate paragraphs (lines inside one are joined back up). Text without any
@@ -1301,8 +1309,8 @@
   const TEXT_PAGE_CSS = `
     .lector-text { max-width: 40em; margin: 0 auto; padding: 64px 24px 48px; font: 20px/1.6 Georgia, serif; color: #222; }
     .lector-text p { margin: 0 0 1em; }
-    .lector-paste { width: 100%; height: 60vh; box-sizing: border-box; padding: 12px; resize: vertical;
-      font: 16px/1.5 system-ui, sans-serif; border: 1px solid #ccc; border-radius: 8px; background: #fff; }`;
+    .lector-hint { margin-top: 20vh; padding: 48px 24px; text-align: center; color: #888;
+      font: 18px/1.5 system-ui, sans-serif; border: 2px dashed #ccc; border-radius: 12px; }`;
 
   // ---------- events ----------
   function isEditable(t) {

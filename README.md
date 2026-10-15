@@ -22,7 +22,7 @@ Tampermonkey checks this address for new versions and updates the script by itse
 | **Esc** | Close the popup |
 | | Words and phrases you've looked up get a dotted purple underline everywhere they appear on the page, until you reload (shown only in reading mode) |
 | Tampermonkey menu → **Open a PDF to read…** | Opens a reader tab: pick a PDF and read it with the same click-to-translate. It reopens each PDF at the page where you left off |
-| Tampermonkey menu → **Read pasted text…** | Opens a reader tab: paste any text (an email, a message, a site where clicking doesn't work) and read it with click-to-translate |
+| Tampermonkey menu → **Read pasted text…** | Opens a reader tab: press Ctrl+V and the text (an email, a message, a site where clicking doesn't work) is ready to click right away. A new paste replaces it; reloading the tab keeps it |
 | Tampermonkey menu → **Swap direction** | Spanish → English (default) or English → Spanish |
 
 ### The popup
