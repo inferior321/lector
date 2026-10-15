@@ -1,0 +1,1293 @@
+// ==UserScript==
+// @name         Lector
+// @namespace    inferior321.lector
+// @version      1.0.0
+// @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and a PDF reader. Alt+T toggles reading mode.
+// @author       inferior321
+// @license      MIT
+// @homepageURL  https://github.com/inferior321/lector
+// @updateURL    https://raw.githubusercontent.com/inferior321/lector/main/lector.user.js
+// @downloadURL  https://raw.githubusercontent.com/inferior321/lector/main/lector.user.js
+// @match        *://*/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @connect      translate.googleapis.com
+// @connect      clients5.google.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  if (window.top !== window.self) return; // skip iframes
+
+  // ---------- settings ----------
+  // Spanish → English by default; the menu swaps to English → Spanish.
+  const cfg = {
+    get reversed() { return GM_getValue('reversed', false); },
+    get source() { return this.reversed ? 'en' : 'es'; },
+    get target() { return this.reversed ? 'es' : 'en'; },
+  };
+
+  // ---------- menu (registered first so it shows up even if a page breaks the UI code) ----------
+  GM_registerMenuCommand('Toggle reading mode (Alt+T)', () => setEnabled(!enabled));
+  GM_registerMenuCommand('Open a PDF to read…', () => (isReaderTab ? openPdfReader() : openReaderTab()));
+  GM_registerMenuCommand('Swap direction (Spanish ⇄ English)', () => {
+    GM_setValue('reversed', !cfg.reversed);
+    hideTip();
+    setEnabled(enabled); // refresh badge text
+  });
+
+  const GOOGLE_BACKOFF_MS = 120_000;
+  const MAX_SENTENCE_CHARS = 600;
+  const HOTKEY = 't'; // with Alt
+
+  // Reading mode always starts off on every page load; Alt+T turns it on/off.
+  let enabled = false;
+
+  // ---------- HTTP ----------
+  function request(opts) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        ...opts,
+        timeout: 15000,
+        onload: resolve,
+        onerror: () => reject(new Error('Network error')),
+        ontimeout: () => reject(new Error('Request timed out')),
+      });
+    });
+  }
+
+  // ---------- Google Translate (free, unofficial endpoint) ----------
+  // Answers are kept across pages and restarts (in Tampermonkey's storage), newest last,
+  // capped so it can't grow forever. Bump CACHE_KEY if the stored format changes.
+  // Loaded on the first lookup, not on every page load (most pages never translate anything).
+  const CACHE_KEY = 'translationCache-v1';
+  const CACHE_MAX_ENTRIES = 2000;
+  let googleCache = null;
+  let googlePausedUntil = 0; // set only while every Google address is refusing (badge / popup countdown)
+  let cacheSaveTimer = 0;
+
+  const loadCache = () => (googleCache ??= new Map(GM_getValue(CACHE_KEY, [])));
+
+  function cacheGet(key) {
+    const cache = loadCache();
+    if (!cache.has(key)) return undefined;
+    const value = cache.get(key);
+    cache.delete(key); // move to the end: recently used
+    cache.set(key, value);
+    return value;
+  }
+
+  function cacheSet(key, value) {
+    const cache = loadCache();
+    cache.set(key, value);
+    if (cache.size > CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value); // oldest
+    clearTimeout(cacheSaveTimer);
+    cacheSaveTimer = setTimeout(saveCache, 1000); // one write per burst of lookups
+  }
+
+  // Merge with what other tabs saved meanwhile, then keep only the newest entries.
+  function saveCache() {
+    const merged = new Map(GM_getValue(CACHE_KEY, []));
+    for (const [k, v] of googleCache) { merged.delete(k); merged.set(k, v); }
+    GM_setValue(CACHE_KEY, [...merged].slice(-CACHE_MAX_ENTRIES));
+  }
+
+  // Two Google addresses give the same answers. When one says "too many requests" it's
+  // paused for a while and the other is used; only when both refuse do we report "busy".
+  const GOOGLE_HOSTS = [
+    { name: 'primary', rewrite: (url) => url, pausedUntil: 0 },
+    { name: 'backup', rewrite: (url) => url.replace('translate.googleapis.com', 'clients5.google.com').replace('client=gtx', 'client=dict-chrome-ex'), pausedUntil: 0 },
+  ];
+
+  async function fetchGoogle(url, key, parse) {
+    const cached = cacheGet(key);
+    if (cached !== undefined) return cached;
+    for (const host of GOOGLE_HOSTS) {
+      if (Date.now() < host.pausedUntil) continue;
+      const res = await request({ method: 'GET', url: host.rewrite(url) });
+      if (res.status === 429 || res.status === 403) {
+        host.pausedUntil = Date.now() + GOOGLE_BACKOFF_MS;
+        continue;
+      }
+      if (res.status !== 200) throw new Error(`Google HTTP ${res.status}`);
+      googlePausedUntil = 0;
+      const result = parse(JSON.parse(res.responseText));
+      cacheSet(key, result);
+      return result;
+    }
+    googlePausedUntil = Math.min(...GOOGLE_HOSTS.map((h) => h.pausedUntil)); // first one back
+    updateBadge();
+    throw busyError();
+  }
+
+  // Google is refusing requests: the error says until when, so the popup and badge can count down.
+  function busyError() {
+    const e = new Error('Google is busy (too many requests)');
+    e.busyUntil = googlePausedUntil;
+    return e;
+  }
+
+  const countdown = (until) => {
+    const secs = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+    return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+  };
+
+  // withDict also asks for dictionary meanings (only useful for a single word or short phrase).
+  function google(text, withDict = false) {
+    const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t'
+      + (withDict ? '&dt=bd' : '')
+      + `&sl=${cfg.source}&tl=${cfg.target}&q=${encodeURIComponent(text)}`;
+    return fetchGoogle(url, `${cfg.source}|${cfg.target}|${withDict}|${text}`, (data) => ({
+      text: (data[0] || []).map((seg) => seg[0] || '').join(''),
+      ...parseDictionary(withDict ? data[1] || [] : [], text),
+    }));
+  }
+
+  // HTML mode (what Chrome's page translator uses): Google moves <b> tags onto the words
+  // they correspond to, so "<b>La</b> vi en la tienda" → "I saw <b>her</b> in the store".
+  // Returns the words inside the tag and the plain translated sentence.
+  function googleTagged(html) {
+    const url = 'https://translate.googleapis.com/translate_a/t?client=gtx&format=html'
+      + `&sl=${cfg.source}&tl=${cfg.target}&q=${encodeURIComponent(html)}`;
+    return fetchGoogle(url, `${cfg.source}|${cfg.target}|html|${html}`, (data) => {
+      const out = [data].flat(2).find((x) => typeof x === 'string') || '';
+      const text = (t) => decodeEntities(t.replace(/<[^>]*>/g, '')).replace(/\s+([.,;:!?])/g, '$1').trim();
+      return { inTag: text(out.match(/<b>([\s\S]*?)<\/b>/)?.[1] || ''), plain: text(out) };
+    });
+  }
+
+  const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+  function decodeEntities(t) {
+    return t.replace(/&(#x[\da-f]+|#\d+|\w+);/gi, (m, e) => {
+      if (e[0] === '#') return String.fromCodePoint(e[1].toLowerCase() === 'x' ? parseInt(e.slice(2), 16) : +e.slice(1));
+      return ENTITIES[e.toLowerCase()] ?? m;
+    });
+  }
+
+  // Dictionary entries look like [partOfSpeech, [meaning, ...], [[meaning, [back-translations], _, score], ...], baseForm].
+  // Returns the meanings for display (most common first, very rare ones dropped), every meaning
+  // for matching against the sentence, and the base form ("pasamos" → "pasar").
+  const RARE_MEANING_SCORE = 0.001;
+  const MEANINGS_SHOWN = 5;
+
+  function parseDictionary(allEntries, word) {
+    // Google sometimes ignores accents and answers for a different word
+    // ("tomó" → "tomo" = volume, "sé" → "se", "está" → "esta" = this): drop those entries.
+    const entries = allEntries.filter((e) => !accentTwin(e[3], word));
+    const meanings = entries.map(([pos, words = [], scored = []]) => {
+      const ranked = scored.length
+        ? scored.map((x) => ({ w: x[0], score: x[3] || 0 })).sort((a, b) => b.score - a.score)
+        : words.map((w) => ({ w, score: 0 }));
+      return {
+        pos,
+        top: ranked[0]?.score || 0,
+        words: ranked.filter((x, i) => i < 3 || x.score >= RARE_MEANING_SCORE).slice(0, MEANINGS_SHOWN).map((x) => x.w),
+      };
+    }).sort((a, b) => b.top - a.top);
+    return {
+      meanings,
+      allMeanings: entries.flatMap((e) => e[1] || []),
+      base: entries.find((e) => typeof e[3] === 'string')?.[3] || '',
+    };
+  }
+
+  const stripAccents = (t) => t.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+
+  function accentTwin(base, word) {
+    return typeof base === 'string' && base.toLowerCase() !== word.toLowerCase()
+      && stripAccents(base) === stripAccents(word);
+  }
+
+  // ---------- meaning in context ----------
+  // Google translates whole sentences, so we have to work out which part of the
+  // translation belongs to the clicked word. Steps, cheapest first:
+  //  1. HTML alignment: send the sentence with the word in <b> tags (Google moves the tag to
+  //     the matching words) and look up the word's dictionary meanings at the same time.
+  //     If the tagged answer is one of those meanings, done ("Pedimos la cuenta" → "bill").
+  //  2. Otherwise it may be a function word or part of an idiom. Try [brackets] too; if both
+  //     agree, take the more complete one ("vale" → "is worth" rather than "is").
+  //  3. Look for a dictionary meaning in the sentence translation ("¿Qué tiempo hace?" → "weather").
+  //  4. Idioms: grow the brackets to include neighbouring words until Google keeps them
+  //     ("[lo pasamos genial]" → "we had a great time"). Brackets keep whole phrases together,
+  //     where HTML alignment would pick a single word ("un ojo" → "arm").
+  //     A phrase answer ending on a dangling word ("we had a") keeps growing if it can.
+  //  5. Give up: the best guess, the word's dictionary meanings, and the whole sentence.
+  // Brackets answers must appear in the plain translation: they can break idioms
+  // ("un [ojo] de la cara" → "an [eye] of the face").
+  const GROW_STEPS = [[1, 0], [0, 1], [1, 1], [2, 0], [0, 2], [2, 1], [1, 2], [2, 2]]; // [left, right] words
+
+  async function translateInContext(phrase, ctx) {
+    if (!ctx) {
+      const r = await google(phrase, true);
+      return { kind: 'fallback', text: tidy(r.text, phrase, true), meanings: r.meanings, sentence: '', base: r.base };
+    }
+    const bracketed = (a, b) => google(markedText(ctx, a, b))
+      .then((r) => r.text.match(/\[([^[\]]+)\]/)?.[1].trim() || null)
+      .catch(() => null);
+    const atStart = /^[\s¿¡"'«“(]*$/.test(ctx.full.slice(ctx.s, ctx.start));
+    const answer = (kind, text, extra) => ({ kind, text: tidy(text, phrase, atStart), base: dict?.base || '', sentence: plain, ...extra });
+
+    // 1.
+    const [tagged, dict] = await Promise.all([
+      googleTagged(taggedText(ctx)).catch(() => null),
+      google(phrase, true).catch(() => null),
+    ]);
+    const meanings = dict?.allMeanings || [];
+    const inTag = tagged?.inTag || '';
+    const plain = tagged?.plain || (await google(sentenceText(ctx))).text;
+    if (inTag && relatesTo(inTag, meanings)) return answer('context', inTag);
+
+    // 2.
+    const inBrackets = await bracketed(ctx.start, ctx.end);
+    const bracketsOk = !!inBrackets && appearsIn(plain, inBrackets);
+    if (bracketsOk && inTag) {
+      const best = appearsIn(inBrackets, inTag) ? inBrackets
+        : appearsIn(inTag, inBrackets) ? inTag
+          : relatesTo(inBrackets, meanings) ? inBrackets : inTag;
+      return answer('context', best);
+    }
+
+    // 3.
+    const hit = meanings.find((w) => appearsIn(plain, w));
+    if (hit) return answer('context', hit);
+    if (bracketsOk) return answer('context', inBrackets);
+
+    // 4. (tried in two parallel batches, smallest phrases first)
+    const { left, right } = wordsAround(ctx);
+    const spans = GROW_STEPS
+      .filter(([l, r]) => l <= left.length && r <= right.length)
+      .map(([l, r]) => ({ a: l ? left[left.length - l].a : ctx.start, b: r ? right[r - 1].b : ctx.end }));
+    let cutOff = null; // first match that ends on a dangling word, used if nothing better turns up
+    for (const batch of [spans.slice(0, 3), spans.slice(3)]) {
+      const found = await Promise.all(batch.map((sp) => bracketed(sp.a, sp.b)));
+      for (const [i, t] of found.entries()) {
+        if (!t || !appearsIn(plain, t)) continue;
+        if (!endsDangling(t)) return answer('phrase', t, { span: batch[i] });
+        cutOff ??= { t, span: batch[i] };
+      }
+    }
+    if (cutOff) return answer('phrase', cutOff.t, { span: cutOff.span });
+
+    // 5.
+    return { kind: 'fallback', text: tidy(inTag || dict?.text || '?', phrase, atStart), meanings: dict?.meanings || [], sentence: plain, base: dict?.base || '' };
+  }
+
+  // Is `answer` one of the dictionary meanings (sharing a real word, not just "the"/"is")?
+  // With no dictionary data we can't tell, so trust it.
+  const FILLER_WORDS = {
+    en: 'a an the to of i you he she it we they is am are be do not have has will would',
+    es: 'el la los las un una de a al del que y o se lo le me te es son ser estar no',
+  };
+  const fillerCache = {};
+  function relatesTo(answer, meanings) {
+    if (!meanings.length) return true;
+    const filler = (fillerCache[cfg.target] ??= new Set(normWords(FILLER_WORDS[cfg.target])));
+    const known = new Set(meanings.flatMap(normWords));
+    return normWords(answer).some((w) => !filler.has(w) && known.has(w));
+  }
+
+  // Small words a phrase translation shouldn't stop on.
+  const DANGLING = {
+    en: new Set(['a', 'an', 'the', 'to', 'of', 'very', 'my', 'your', 'his', 'her', 'its', 'our', 'their',
+      'at', 'in', 'on', 'for', 'with', 'and', 'or', 'but', 'is', 'are', 'was', 'were']),
+    es: new Set(['el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'a', 'al', 'en', 'con',
+      'por', 'para', 'muy', 'mi', 'tu', 'su', 'mis', 'tus', 'sus', 'y', 'o', 'que', 'es', 'son']),
+  };
+
+  function endsDangling(text) {
+    const last = text.toLowerCase().match(/[\p{L}']+(?=[^\p{L}']*$)/u)?.[0];
+    return !!last && DANGLING[cfg.target].has(last);
+  }
+
+  // Strip stray punctuation and the capital letter Google adds at the start of a sentence
+  // ("You have to" → "you have to"), but keep "I"/"I'm" and capitals the original had (names).
+  function tidy(text, phrase, atSentenceStart) {
+    let t = text.trim().replace(/^[\s.,;:!?¿¡"'“”«»()]+|[\s.,;:!?¿¡"'“”«»()]+$/g, '');
+    const nameLike = /^\p{Lu}/u.test(phrase) && !atSentenceStart;
+    const keepsCapital = cfg.target === 'en' && /^I(\b|')/.test(t);
+    if (!nameLike && !keepsCapital) t = t.charAt(0).toLowerCase() + t.slice(1);
+    return t || text.trim();
+  }
+
+  // Does `needle` appear (roughly, ignoring word endings) in `haystack`?
+  function appearsIn(haystack, needle) {
+    const have = new Set(normWords(haystack));
+    const want = normWords(needle);
+    return want.length > 0 && want.every((w) => have.has(w));
+  }
+
+  function normWords(text) {
+    let t = text.toLowerCase().replace(/’/g, "'");
+    if (cfg.target === 'en') {
+      t = t.replace(/\bcan't\b/g, 'can not').replace(/\bwon't\b/g, 'will not').replace(/n't\b/g, ' not')
+        .replace(/'re\b/g, ' are').replace(/'m\b/g, ' am').replace(/'ll\b/g, ' will')
+        .replace(/'ve\b/g, ' have').replace(/'d\b/g, ' would').replace(/'s\b/g, ' is');
+    }
+    return (t.match(/[\p{L}\p{N}']+/gu) || []).map(stem);
+  }
+
+  // crude stem so "realized"/"realize", "hurts"/"hurt", "dolores"/"dolor" compare equal
+  function stem(w) {
+    w = w.normalize('NFD').replace(/\p{M}/gu, '');
+    if (w.length > 4) w = w.replace(/(ies|es|s|ed|ing|ly)$/, '');
+    return w.slice(0, 6);
+  }
+
+  // ---------- finding the word and its sentence ----------
+  const wordChar = /[\p{L}\p{M}\p{N}'’-]/u;
+
+  function caretAt(x, y) {
+    if (document.caretRangeFromPoint) return document.caretRangeFromPoint(x, y);
+    const p = document.caretPositionFromPoint?.(x, y);
+    if (!p) return null;
+    const r = document.createRange();
+    r.setStart(p.offsetNode, p.offset);
+    return r;
+  }
+
+  function wordRangeAt(x, y) {
+    const caret = caretAt(x, y);
+    if (!caret || caret.startContainer.nodeType !== Node.TEXT_NODE) return null;
+    const node = caret.startContainer;
+    const text = node.data;
+    let start = caret.startOffset;
+    let end = caret.startOffset;
+    while (start > 0 && wordChar.test(text[start - 1])) start--;
+    while (end < text.length && wordChar.test(text[end])) end++;
+    // trim stray hyphens/apostrophes at the edges
+    while (start < end && /['’-]/.test(text[start])) start++;
+    while (end > start && /['’-]/.test(text[end - 1])) end--;
+    if (start === end) return null;
+
+    const range = document.createRange();
+    range.setStart(node, start);
+    range.setEnd(node, end);
+    // the caret API snaps to the nearest text, so make sure the click was really on the word
+    const r = range.getBoundingClientRect();
+    if (x < r.left - 2 || x > r.right + 2 || y < r.top - 2 || y > r.bottom + 2) return null;
+    return range;
+  }
+
+  // Move a caret position outwards to the edge of the word it sits in (if any).
+  function snapToWordEdge(node, offset, toEnd) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const t = node.data;
+      if (toEnd) while (offset < t.length && wordChar.test(t[offset])) offset++;
+      else while (offset > 0 && wordChar.test(t[offset - 1])) offset--;
+    }
+    return [node, offset];
+  }
+
+  // Range covering every whole word between two caret positions, in either drag direction.
+  function wordSpan(a, b) {
+    try {
+      const probe = document.createRange();
+      probe.setStart(a.startContainer, a.startOffset);
+      const [first, last] = probe.comparePoint(b.startContainer, b.startOffset) < 0 ? [b, a] : [a, b];
+      const range = document.createRange();
+      range.setStart(...snapToWordEdge(first.startContainer, first.startOffset, false));
+      range.setEnd(...snapToWordEdge(last.startContainer, last.startOffset, true));
+      return range;
+    } catch {
+      return null; // points in different documents/shadow trees
+    }
+  }
+
+  function blockAncestor(node) {
+    let el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    const pdfPage = el?.closest('.textLayer'); // PDF reader: each page's text is one block
+    if (pdfPage) return pdfPage;
+    while (el && el !== document.body) {
+      if (!getComputedStyle(el).display.startsWith('inline')) return el;
+      el = el.parentElement;
+    }
+    return document.body;
+  }
+
+  // Abbreviations that never end a sentence (lowercase, without the final period).
+  const NON_FINAL_ABBREVIATIONS = {
+    es: new Set(['sr', 'sra', 'srta', 'sres', 'sras', 'dr', 'dra', 'dres', 'don', 'dña', 'lic', 'lcdo',
+      'lcda', 'ing', 'prof', 'profa', 'arq', 'gral', 'cnel', 'tte', 'cap', 'sto', 'sta', 'av', 'avda',
+      'pza', 'núm', 'nro', 'pág', 'págs', 'tel', 'apdo', 'dpto', 'depto', 'ud', 'uds', 'vd', 'vds',
+      'ee', 'ej', 'cía', 'fig', 'vol', 'art', 'admón', 'mr', 'mrs']),
+    en: new Set(['mr', 'mrs', 'ms', 'dr', 'prof', 'st', 'sr', 'gen', 'col', 'capt', 'lt', 'sgt', 'rev',
+      'hon', 'mt', 'vs', 'e.g', 'i.e', 'cf', 'fig', 'vol', 'pp', 'approx', 'dept', 'est']),
+  };
+
+  function endsWithNonFinal(sentence, abbrevs) {
+    const m = sentence.trimEnd().match(/(\S+)\.$/);
+    if (!m) return false;
+    const token = m[1].replace(/^[([¿¡"'«“]+/, '').toLowerCase();
+    if (/^\p{L}$/u.test(token)) return true; // single letters: "J. K. Rowling", "p. ej."
+    return abbrevs.has(token);
+  }
+
+  // Sentence spans [{ start, end }] of `text`. The browser's segmenter already avoids
+  // splitting before a lowercase word ("casa... y se durmió", "EE. UU. el lunes"), but it
+  // doesn't know abbreviations, so pieces ending in one ("Sr.", "Dra.", "J.") get rejoined.
+  // Text without sentence punctuation (tables of contents, lists, headings) gets extra breaks:
+  // after dot leaders ("Capítulo 4 ........ 7"), and, in PDFs (pdfLines), at a real line end
+  // ("\n", see joinPdfLines) when the next line starts with a capital or a number. Sentences
+  // that merely wrapped onto the next line were already joined with a space.
+  function splitSentences(text, lang, pdfLines = false) {
+    const abbrevs = NON_FINAL_ABBREVIATIONS[lang];
+    // same-length whitespace normalisation: line breaks in the HTML source aren't real breaks
+    const flat = text.replace(/\s/g, ' ');
+    const out = [];
+    for (const seg of new Intl.Segmenter(lang, { granularity: 'sentence' }).segment(flat)) {
+      const prev = out.at(-1);
+      const end = seg.index + seg.segment.length;
+      if (prev && endsWithNonFinal(flat.slice(prev.start, prev.end), abbrevs)) prev.end = end;
+      else out.push({ start: seg.index, end });
+    }
+    const hardBreaks = [...text.matchAll(/\.{4,}\s*\d*/g)].map((m) => m.index + m[0].length);
+    if (pdfLines) {
+      for (const m of text.matchAll(/\n(?=\s*[\p{Lu}\p{N}¿¡])/gu)) hardBreaks.push(m.index + 1);
+    }
+    return out.flatMap((p) => {
+      const cuts = hardBreaks.filter((i) => i > p.start && i < p.end).sort((a, b) => a - b);
+      return [p.start, ...cuts].map((start, i) => ({ start, end: cuts[i] ?? p.end }));
+    });
+  }
+
+  // Where the word/phrase sits: its block element, the block's text, the sentence span
+  // [s, e) and the word span [start, end), all as offsets into that text. null if unusable.
+  function sentenceAround(range) {
+    const block = blockAncestor(range.commonAncestorContainer);
+    if (!block.contains(range.startContainer) || !block.contains(range.endContainer)) return null;
+
+    const before = document.createRange();
+    before.setStart(block, 0);
+    before.setEnd(range.startContainer, range.startOffset);
+    const full = block.textContent;
+    const start = before.toString().length;
+    const end = start + range.toString().length;
+    if (!full.slice(start, end).trim()) return null;
+
+    const hits = splitSentences(full, cfg.source, block.classList.contains('textLayer')).filter((p) => p.end > start && p.start < end);
+    let s = hits.length ? hits[0].start : 0;
+    let e = hits.length ? hits.at(-1).end : full.length;
+    if (e - s > MAX_SENTENCE_CHARS) { // very long "sentence" (lists, no punctuation): keep a window
+      s = Math.max(s, start - MAX_SENTENCE_CHARS / 2);
+      e = Math.min(e, end + MAX_SENTENCE_CHARS / 2);
+    }
+    return { block, full, s, e, start, end };
+  }
+
+  const clean = (t) => t.replace(/[[\]]/g, (c) => (c === '[' ? '(' : ')')).replace(/\s+/g, ' ');
+
+  function sentenceText(ctx) {
+    return clean(ctx.full.slice(ctx.s, ctx.e)).trim();
+  }
+
+  // The sentence with [a, b) wrapped in brackets.
+  function markedText(ctx, a, b) {
+    const { full, s, e } = ctx;
+    return `${clean(full.slice(s, a)).trimStart()}[${clean(full.slice(a, b)).trim()}]${clean(full.slice(b, e)).trimEnd()}`.trim();
+  }
+
+  // The sentence as HTML with [start, end) wrapped in <b> tags.
+  function taggedText(ctx) {
+    const { full, s, e, start, end } = ctx;
+    const esc = (t) => clean(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return `${esc(full.slice(s, start)).trimStart()}<b>${esc(full.slice(start, end)).trim()}</b>${esc(full.slice(end, e)).trimEnd()}`.trim();
+  }
+
+  // Word spans before and after the clicked word/phrase, within the sentence.
+  function wordsAround(ctx) {
+    const words = [...ctx.full.slice(ctx.s, ctx.e).matchAll(/[\p{L}\p{M}\p{N}'’-]+/gu)]
+      .map((m) => ({ a: ctx.s + m.index, b: ctx.s + m.index + m[0].length }));
+    return { left: words.filter((w) => w.b <= ctx.start), right: words.filter((w) => w.a >= ctx.end) };
+  }
+
+  // DOM range for text offsets [a, b) inside `block`.
+  function rangeFromOffsets(block, a, b) {
+    const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+    const range = document.createRange();
+    let pos = 0;
+    let started = false;
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const len = n.data.length;
+      if (!started && a <= pos + len) { range.setStart(n, a - pos); started = true; }
+      if (started && b <= pos + len) { range.setEnd(n, b - pos); return range; }
+      pos += len;
+    }
+    return null;
+  }
+
+  // ---------- UI ----------
+  const pageStyle = document.createElement('style');
+  pageStyle.textContent =
+    '::highlight(lector-hover) { background-color: rgba(149, 102, 230, .25); }' +
+    '::highlight(lector-word) { background-color: rgba(149, 102, 230, .5); }';
+  document.head.appendChild(pageStyle);
+
+  // Popup lives in a shadow root so the page's CSS can't mess with it.
+  const host = document.createElement('div');
+  host.style.cssText = 'position:absolute;top:0;left:0;z-index:2147483647;';
+  const shadow = host.attachShadow({ mode: 'open' });
+  // Built with DOM calls, not innerHTML: sites with Trusted Types (YouTube, Gmail…) block innerHTML.
+  const shadowStyle = document.createElement('style');
+  shadowStyle.textContent = `
+      .tip { position: absolute; width: max-content; max-width: 320px; min-width: 120px; box-sizing: border-box;
+        background: #1f2430; color: #f2f2f2; font: 14px/1.4 system-ui, sans-serif;
+        padding: 8px 10px; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.35);
+        border-left: 3px solid #4a5160; }
+      .tip[data-kind="context"] { border-left-color: #81c784; }
+      .tip[data-kind="phrase"] { border-left-color: #8fb4ff; }
+      .tip[data-kind="fallback"] { border-left-color: #e0b25c; }
+      .tip[data-kind="error"] { border-left-color: #ff8a80; }
+      .head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+      .orig { color: #9aa3b2; font-size: 12px; }
+      .base { color: #c9cfda; font-style: italic; }
+      .tag { font-size: 11px; white-space: nowrap; }
+      .st-loading { color: #9aa3b2; }
+      .st-context { color: #81c784; }
+      .st-phrase { color: #8fb4ff; }
+      .st-fallback { color: #e0b25c; }
+      .st-error { color: #ff8a80; }
+      .main { font-size: 16px; font-weight: 600; margin-top: 2px; }
+      .details { margin-top: 6px; padding-top: 6px; border-top: 1px solid #343b4b;
+        display: grid; gap: 2px; }
+      .detail { color: #d6dbe4; font-size: 13px; }
+      .label { color: #8fb4ff; }
+      .err { color: #ff8a80; }
+      .pair { display: grid; grid-template-columns: auto 1fr; gap: 3px 8px; font-size: 12px; line-height: 1.45; }
+      .detail + .pair { margin-top: 4px; }
+      .lang { color: #6f7a8c; font-size: 10px; padding-top: 2px; }
+      .src { color: #9aa3b2; }
+      .dst { color: #d6dbe4; }
+      .hl { background: rgba(167, 125, 240, .4); color: inherit; border-radius: 3px; padding: 0 2px; }
+      .toggle { margin-top: 6px; font-size: 12px; color: #9aa3b2; cursor: pointer; user-select: none; }
+      .toggle:hover { color: #d6dbe4; }
+      .say { all: unset; cursor: pointer; margin-left: 6px; padding: 0 3px; border-radius: 4px; font-size: 12px; opacity: .75; }
+      .say:hover { opacity: 1; }
+      .say.loading { animation: lector-pulse .9s ease-in-out infinite; }
+      .say.playing { opacity: 1; background: rgba(167, 125, 240, .35); box-shadow: 0 0 6px rgba(167, 125, 240, .7); }
+      .say.failed { opacity: .9; }
+      @keyframes lector-pulse { 50% { opacity: .2; } }
+      .retry { all: unset; cursor: pointer; display: inline-block; margin-top: 8px; padding: 2px 10px; border-radius: 5px;
+        background: #343b4b; color: #f2f2f2; font-size: 12px; }
+      .retry:hover { background: #46506a; }
+      .retry:disabled { opacity: .4; cursor: default; }
+      .dict { display: block; margin-top: 6px; text-align: right; font-size: 11px; color: #8fb4ff;
+        text-decoration: none; }
+      .dict:hover { text-decoration: underline; }
+      .pdfbar { position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 1;
+        background: #1f2430; color: #f2f2f2; font: 13px system-ui, sans-serif; padding: 5px 10px;
+        border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
+      .pdfstatus { display: flex; align-items: center; gap: 6px; }
+      .pdfbar button { all: unset; cursor: pointer; padding: 1px 9px; border-radius: 5px; background: #343b4b; }
+      .pdfbar button:hover { background: #46506a; }
+      .pdfbar input { width: 3.2em; background: #2a3040; color: #f2f2f2; border: 1px solid #46506a;
+        border-radius: 4px; padding: 1px 4px; font: inherit; }
+      .pdfzoom { min-width: 3.2em; text-align: center; }
+      .pdfsep { width: 10px; }
+      .badge { position: fixed; bottom: 12px; right: 12px; background: #6a3fb5; color: #fff;
+        font: 12px system-ui, sans-serif; padding: 4px 8px; border-radius: 6px;
+        cursor: pointer; opacity: .85; }
+      .badge.busy { background: #b7791f; }`;
+  const tipEl = el('div', 'tip');
+  tipEl.hidden = true;
+  const badgeEl = el('div', 'badge');
+  badgeEl.hidden = true;
+  badgeEl.title = 'Click or press Alt+T to turn off';
+  badgeEl.onclick = () => setEnabled(false);
+  shadow.append(shadowStyle, tipEl, badgeEl);
+  document.body.appendChild(host);
+
+  let lookupId = 0;
+
+  function hideTip() {
+    lookupId++;
+    tipEl.hidden = true;
+    if (window.CSS?.highlights) CSS.highlights.delete('lector-word');
+  }
+
+  function placeTip(rect) {
+    const gap = 6;
+    const w = tipEl.offsetWidth;
+    const h = tipEl.offsetHeight;
+    let left = Math.min(rect.left, window.innerWidth - w - 8);
+    left = Math.max(8, left);
+    let top = rect.bottom + gap;
+    if (top + h > window.innerHeight && rect.top - gap - h > 0) top = rect.top - gap - h;
+    tipEl.style.left = `${window.scrollX + left}px`;
+    tipEl.style.top = `${window.scrollY + top}px`;
+  }
+
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+
+  // Strong purple on the word/phrase being translated (or being dragged over).
+  function markWord(range) {
+    if (!window.CSS?.highlights) return;
+    const h = new Highlight(range);
+    h.priority = 1; // paint over the light hover purple
+    CSS.highlights.set('lector-word', h);
+  }
+
+  async function lookup(range, phrase) {
+    const id = ++lookupId;
+    const rect = range.getBoundingClientRect();
+    const ctx = sentenceAround(range);
+    markWord(range);
+
+    renderTip(phrase, 'loading', '…');
+    tipEl.hidden = false;
+    placeTip(rect);
+
+    let result;
+    try {
+      result = await translateInContext(phrase, ctx);
+    } catch (e) {
+      if (id !== lookupId) return;
+      showError(e, id, rect, () => lookup(range, phrase), phrase);
+      return;
+    }
+    if (id !== lookupId) return; // user clicked something else meanwhile
+
+    const details = [];
+    const phraseText = result.kind === 'phrase' ? clean(ctx.full.slice(result.span.a, result.span.b)).trim() : phrase;
+    if (result.kind === 'phrase') {
+      details.push(detail('phrase: ', phraseText));
+      const phraseRange = rangeFromOffsets(ctx.block, result.span.a, result.span.b);
+      if (phraseRange) markWord(phraseRange);
+    }
+    const span = result.span || (ctx && { a: ctx.start, b: ctx.end });
+    const pair = () => sentencePair(ctx, span, result.sentence, result.text);
+    if (result.kind === 'fallback') {
+      for (const { pos, words } of result.meanings) details.push(detail(`${pos}: `, words.join(', ')));
+      if (ctx && result.sentence) details.push(pair());
+    }
+    const base = result.base && result.base.toLowerCase() !== phrase.toLowerCase() ? result.base : '';
+    renderTip(phrase, result.kind, result.text, details, base);
+    tipEl.querySelector('.orig').append(sayButton(phrase));
+    if (result.kind !== 'fallback' && ctx && result.sentence) tipEl.append(sentenceToggle(pair, rect));
+    tipEl.append(dictionaryLink(phraseText));
+    placeTip(rect);
+  }
+
+  //   banco                        ✕ error
+  //   Google is busy — try again in 1:42
+  //   [ Retry ]          (enabled once the countdown ends)
+  function showError(err, id, rect, retry, phrase) {
+    const busy = err.busyUntil && err.busyUntil > Date.now();
+    renderTip(phrase, 'error', busy ? `Google is busy — try again in ${countdown(err.busyUntil)}` : err.message);
+    const btn = el('button', 'retry', 'Retry');
+    btn.onclick = (e) => { e.stopPropagation(); retry(); };
+    tipEl.append(btn);
+    placeTip(rect);
+    if (!busy) return;
+    btn.disabled = true;
+    const timer = setInterval(() => {
+      if (id !== lookupId) { clearInterval(timer); return; } // popup moved on
+      const main = tipEl.querySelector('.main');
+      if (Date.now() >= err.busyUntil) {
+        clearInterval(timer);
+        main.textContent = 'Google should accept requests again.';
+        btn.disabled = false;
+      } else main.textContent = `Google is busy — try again in ${countdown(err.busyUntil)}`;
+    }, 1000);
+  }
+
+  // Every popup has the same layout:
+  //   [clicked text · base form]          [status tag]
+  //   [answer]
+  //   [details: phrase, then dictionary meanings, then the sentence — only those that apply]
+  const STATUS = {
+    loading: { label: '…', cls: 'st-loading' },
+    context: { label: '✓ in context', cls: 'st-context' },
+    phrase: { label: '◐ from phrase', cls: 'st-phrase' },
+    fallback: { label: '? not sure', cls: 'st-fallback' },
+    error: { label: '✕ error', cls: 'st-error' },
+  };
+
+  function renderTip(phrase, kind, answer, details = [], base = '') {
+    const status = STATUS[kind];
+    tipEl.dataset.kind = kind; // colours the left edge to match the status
+    const head = el('div', 'head');
+    const orig = el('span', 'orig', phrase);
+    if (base) orig.append(el('span', 'base', ` · ${base}`));
+    head.append(orig, el('span', `tag ${status.cls}`, status.label));
+    tipEl.replaceChildren(head, el('div', kind === 'error' ? 'main err' : 'main', answer));
+    if (details.length) {
+      const box = el('div', 'details');
+      box.append(...details);
+      tipEl.append(box);
+    }
+  }
+
+  // Collapsed "▸ sentence" row; clicking it shows the original and translated sentence
+  // (the translation was already fetched while working out the word, so this costs nothing).
+  function sentenceToggle(makePair, rect) {
+    const row = el('div', 'toggle', '▸ sentence');
+    row.onclick = () => {
+      const box = el('div', 'details');
+      box.append(makePair());
+      row.replaceWith(box);
+      placeTip(rect);
+    };
+    return row;
+  }
+
+  // Original sentence above its translation, with the clicked word/phrase highlighted in the
+  // original and the matching words highlighted in the translation.
+  //   ES  Me senté en el [banco] del parque.
+  //   EN  I sat on the park [bench].
+  function sentencePair(ctx, span, translated, answer) {
+    const { full, s, e } = ctx;
+    const original = [clean(full.slice(s, span.a)).trimStart(), clean(full.slice(span.a, span.b)).trim(),
+      clean(full.slice(span.b, e)).trimEnd()];
+    const at = locate(translated, answer);
+    const english = at ? [translated.slice(0, at[0]), translated.slice(at[0], at[1]), translated.slice(at[1])] : [translated, '', ''];
+    const src = marked('src', original);
+    src.append(sayButton(original.join('')));
+    const pair = el('div', 'pair');
+    pair.append(el('span', 'lang', cfg.source.toUpperCase()), src,
+      el('span', 'lang', cfg.target.toUpperCase()), marked('dst', english));
+    return pair;
+  }
+
+  function marked(cls, [before, hit, after]) {
+    const line = el('span', cls);
+    line.append(before);
+    if (hit) line.append(el('mark', 'hl', hit));
+    line.append(after);
+    return line;
+  }
+
+  // Where `needle` sits in `haystack`: exact (ignoring case) if possible, otherwise the
+  // shortest run of words that contains all its words ("it is" in "It's very cold").
+  function locate(haystack, needle) {
+    if (!needle) return null;
+    const i = haystack.toLowerCase().indexOf(needle.toLowerCase());
+    if (i >= 0) return [i, i + needle.length];
+    const want = normWords(needle);
+    const words = [...haystack.matchAll(/[\p{L}\p{N}'’]+/gu)];
+    let best = null;
+    for (let a = 0; a < words.length; a++) {
+      for (let b = a; b < Math.min(words.length, a + want.length + 3); b++) {
+        const got = new Set(normWords(words.slice(a, b + 1).map((m) => m[0]).join(' ')));
+        if (!want.every((w) => got.has(w))) continue;
+        const range = [words[a].index, words[b].index + words[b][0].length];
+        if (!best || range[1] - range[0] < best[1] - best[0]) best = range;
+        break;
+      }
+    }
+    return best;
+  }
+
+  // ---------- pronunciation ----------
+  // Google Translate's voice, fetched through Tampermonkey: Google refuses audio requests that
+  // carry a referring site, which a normal <audio> on the page would send. Nothing is fetched
+  // until 🔊 is clicked; clips are kept in memory so replays are free. Google's limit is about
+  // 200 characters per clip, so longer text is spoken in chunks.
+  const TTS_MAX_CHARS = 190;
+  const TTS_CACHE_MAX = 60;
+  const ttsCache = new Map(); // text → blob URL
+  let nowPlaying = null;
+
+  // 🔊 states: idle → .loading (pulses while fetching) → .playing (purple glow; click to stop)
+  // → back to idle. On failure it becomes 🔇; hover says why, click to try again.
+  function sayButton(text) {
+    const btn = el('button', 'say', '🔊');
+    btn.title = 'Listen';
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      if (btn.classList.contains('playing')) { nowPlaying?.pause(); return; }
+      btn.textContent = '🔊';
+      btn.classList.remove('failed');
+      btn.title = 'Listen';
+      speak(text, btn).catch((err) => {
+        btn.textContent = '🔇';
+        btn.classList.add('failed');
+        btn.title = `No audio: ${err.message} (click to try again)`;
+      });
+    };
+    return btn;
+  }
+
+  async function speak(text, btn) {
+    nowPlaying?.pause();
+    btn.classList.add('loading');
+    try {
+      for (const chunk of speechChunks(text.trim())) {
+        const audio = new Audio(await ttsClip(chunk));
+        nowPlaying = audio;
+        btn.classList.replace('loading', 'playing');
+        await new Promise((resolve, reject) => {
+          audio.onpause = resolve; // also fires at the natural end
+          audio.onerror = () => reject(new Error('this page blocks the audio'));
+          audio.play().catch(reject);
+        });
+        if (!audio.ended) return; // stopped by a click or a newer 🔊
+      }
+    } finally {
+      btn.classList.remove('loading', 'playing');
+    }
+  }
+
+  async function ttsClip(text) {
+    const key = `${cfg.source}|${text}`;
+    if (ttsCache.has(key)) return ttsCache.get(key);
+    const res = await request({
+      method: 'GET',
+      url: `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=gtx&tl=${cfg.source}&q=${encodeURIComponent(text)}`,
+      responseType: 'arraybuffer',
+    });
+    if (res.status !== 200) throw new Error(`Google voice HTTP ${res.status}`);
+    const url = URL.createObjectURL(new Blob([res.response], { type: 'audio/mpeg' }));
+    ttsCache.set(key, url);
+    if (ttsCache.size > TTS_CACHE_MAX) {
+      const [oldKey, oldUrl] = ttsCache.entries().next().value;
+      URL.revokeObjectURL(oldUrl);
+      ttsCache.delete(oldKey);
+    }
+    return url;
+  }
+
+  // Split at spaces into pieces Google will accept.
+  function speechChunks(text) {
+    const chunks = [];
+    let current = '';
+    for (const word of text.split(/\s+/)) {
+      if (current && (current + ' ' + word).length > TTS_MAX_CHARS) { chunks.push(current); current = word; }
+      else current = current ? `${current} ${word}` : word;
+    }
+    if (current) chunks.push(current);
+    return chunks;
+  }
+
+  // SpanishDict covers both directions and recognises conjugated forms ("pasamos" → pasar).
+  function dictionaryLink(text) {
+    const a = el('a', 'dict', 'SpanishDict ↗');
+    a.href = `https://www.spanishdict.com/translate/${encodeURIComponent(text)}`;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    return a;
+  }
+
+  function detail(label, text) {
+    const line = el('div', 'detail');
+    line.append(el('span', 'label', label), text);
+    return line;
+  }
+
+  function setEnabled(on) {
+    enabled = on;
+    if (!on) { hideTip(); clearHover(); }
+    badgeEl.hidden = !on;
+    updateBadge();
+  }
+
+  //   [Lector: es → en]             normal (purple)
+  //   [⚠ Google busy · 1:42]        while Google refuses requests (amber, counts down)
+  let badgeTimer = 0;
+  function updateBadge() {
+    clearTimeout(badgeTimer);
+    const busy = Date.now() < googlePausedUntil;
+    badgeEl.classList.toggle('busy', busy);
+    badgeEl.textContent = busy ? `⚠ Google busy · ${countdown(googlePausedUntil)}` : `Lector: ${cfg.source} → ${cfg.target}`;
+    if (busy) badgeTimer = setTimeout(updateBadge, 1000);
+  }
+
+  // ---------- PDF reader ----------
+  // Brave's own PDF viewer can't be reached by userscripts, so PDFs are opened from the menu
+  // ("Open a PDF to read…"). That opens a reader tab on example.com: a plain page with no
+  // security rules (many big sites, e.g. Google, block the code PDF.js needs). There you pick
+  // a file; PDF.js (downloaded once, then kept in Tampermonkey's storage) draws each page on a
+  // canvas with an invisible text layer on top, and the normal hover/click/drag code works on
+  // that text.
+  const READER_URL = 'https://example.com/#lector-pdf';
+  const isReaderTab = location.hostname === 'example.com' && location.hash === '#lector-pdf';
+  const PDF_ZOOM_STEP = 1.15;
+
+  // A normal browser tab: the file picker doesn't open in tabs made by Tampermonkey's
+  // GM_openInTab, so don't switch to that.
+  function openReaderTab() {
+    if (!window.open(READER_URL, '_blank')) location.href = READER_URL; // popup blocked: use this tab
+  }
+  let pdfjs = null;
+  let pdfReader = null; // { doc, scale, pages: [{ div, rendered }], observer }
+
+  async function openPdfReader() {
+    if (pdfReader) return;
+    pdfReader = { doc: null, scale: 1, pages: [] };
+    const bar = pdfToolbar();
+    let file;
+    try {
+      file = await pickPdfFile(bar);
+      bar.status.textContent = 'Loading PDF…';
+      // isEvalSupported: false closes CVE-2024-4367 (a crafted PDF could run code via font eval
+      // in PDF.js ≤ 4.1.392, which includes the 3.11 build used here).
+      const data = new Uint8Array(await file.arrayBuffer());
+      pdfReader.doc = await (await loadPdfJs()).getDocument({ data, isEvalSupported: false }).promise;
+    } catch (e) {
+      bar.status.textContent = `Couldn't open PDF: ${e.message}`;
+      pdfReader = null;
+      setTimeout(() => bar.el.remove(), 6000);
+      return;
+    }
+
+    // The tab becomes the reader: drop the page's content and styles (not ours).
+    for (const n of [...document.body.childNodes]) if (n !== host) n.remove();
+    document.querySelectorAll('style, link[rel~="stylesheet"]').forEach((n) => n !== pageStyle && n.remove());
+    document.documentElement.style.cssText = 'height:auto;overflow:auto;';
+    document.body.style.cssText = 'margin:0;height:auto;overflow:auto;background:#525659;';
+    document.title = file.name;
+    const style = document.createElement('style');
+    style.textContent = PDF_PAGE_CSS;
+    document.head.append(style);
+    const container = el('div', 'lector-pdf');
+    document.body.prepend(container);
+    window.scrollTo(0, 0);
+
+    const first = await pdfReader.doc.getPage(1);
+    const width = first.getViewport({ scale: 1 }).width;
+    pdfReader.scale = Math.min(1.6, (window.innerWidth - 48) / width); // fit width, not huge
+    for (let n = 1; n <= pdfReader.doc.numPages; n++) {
+      const div = el('div', 'lector-page');
+      div.dataset.page = n;
+      container.append(div);
+      pdfReader.pages.push({ div, rendered: false });
+    }
+    pdfReader.observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) if (entry.isIntersecting) renderPdfPage(+entry.target.dataset.page);
+    }, { rootMargin: '1200px 0px' });
+    await layoutPdfPages();
+    bar.ready(pdfReader.doc.numPages);
+    setEnabled(true);
+  }
+
+  // Runs PDF.js inside the userscript. The worker code is loaded first so PDF.js runs it on
+  // the main thread instead of starting a separate worker. PDF.js registers itself on the real
+  // global object, which in Tampermonkey isn't the script's `window` (a stand-in), so it's
+  // looked up explicitly.
+  async function loadPdfJs() {
+    if (pdfjs) return pdfjs;
+    const codes = [await pdfJsCode('pdfjsWorker'), await pdfJsCode('pdfjs')];
+    for (const code of codes) new Function(code)(); // eslint-disable-line no-new-func
+    pdfjs = new Function('return this')().pdfjsLib; // eslint-disable-line no-new-func
+    if (!pdfjs) throw new Error("PDF.js didn't start");
+    return pdfjs;
+  }
+
+  // PDF.js is downloaded from cdnjs the first time (cdnjs allows any site to fetch it) and
+  // kept in Tampermonkey's storage after that.
+  const PDFJS_VERSION = '3.11.174';
+  const PDFJS_FILES = { pdfjs: 'pdf.min.js', pdfjsWorker: 'pdf.worker.min.js' };
+
+  async function pdfJsCode(name) {
+    const key = `code-${name}-${PDFJS_VERSION}`;
+    const saved = GM_getValue(key, '');
+    if (saved) return saved;
+    const res = await fetch(`https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}/${PDFJS_FILES[name]}`);
+    if (!res.ok) throw new Error(`couldn't download PDF.js (HTTP ${res.status})`);
+    const code = await res.text();
+    GM_setValue(key, code);
+    return code;
+  }
+
+  function pickPdfFile(bar) {
+    return new Promise((resolve, reject) => {
+      const input = el('input');
+      input.type = 'file';
+      input.accept = 'application/pdf,.pdf';
+      input.onchange = () => (input.files[0] ? resolve(input.files[0]) : reject(new Error('no file chosen')));
+      const choose = el('button', null, 'Choose PDF…');
+      const cancel = el('button', null, 'Cancel');
+      choose.onclick = () => input.click();
+      cancel.onclick = () => reject(new Error('cancelled'));
+      bar.status.replaceChildren('Open a PDF to read:', choose, cancel);
+    });
+  }
+
+  // Size every page placeholder for the current zoom; pages are only drawn near the screen.
+  async function layoutPdfPages() {
+    const { doc, scale, pages, observer } = pdfReader;
+    observer.disconnect();
+    for (const [i, p] of pages.entries()) {
+      const vp = (await doc.getPage(i + 1)).getViewport({ scale });
+      p.div.replaceChildren();
+      p.div.style.width = `${vp.width}px`;
+      p.div.style.height = `${vp.height}px`;
+      p.rendered = false;
+      observer.observe(p.div);
+    }
+  }
+
+  async function renderPdfPage(n) {
+    const p = pdfReader.pages[n - 1];
+    if (p.rendered) return;
+    p.rendered = true;
+    const scale = pdfReader.scale;
+    const page = await pdfReader.doc.getPage(n);
+    const vp = page.getViewport({ scale });
+    const dpr = window.devicePixelRatio || 1;
+    const canvas = el('canvas');
+    canvas.width = Math.floor(vp.width * dpr);
+    canvas.height = Math.floor(vp.height * dpr);
+    const text = el('div', 'textLayer');
+    text.style.setProperty('--scale-factor', scale);
+    p.div.replaceChildren(canvas, text);
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp, transform: dpr === 1 ? null : [dpr, 0, 0, dpr, 0, 0] }).promise;
+    if (scale !== pdfReader.scale) return; // zoom changed meanwhile
+    await pdfjs.renderTextLayer({ textContentSource: await page.getTextContent(), container: text, viewport: vp, textDivs: [] }).promise;
+    joinPdfLines(text);
+  }
+
+  // PDF.js marks line ends with <br>, which don't count as text, so the last word of a line
+  // would run into the first word of the next ("parque.Fui"). Each <br> becomes:
+  //   ''   after a hyphenated line end ("tra-" + "bajo")
+  //   ' '  when the sentence just wrapped onto the next line
+  //   '\n' at a real line end (heading, table-of-contents entry, list item, end of paragraph);
+  //        splitSentences may end a sentence there if the next line starts with a capital.
+  function joinPdfLines(layer) {
+    const lines = [[]];
+    const brs = [];
+    for (const node of layer.childNodes) {
+      if (node.nodeName === 'BR') { brs.push(node); lines.push([]); } else if (node.nodeType === Node.ELEMENT_NODE) lines.at(-1).push(node);
+    }
+    const boxes = lines.map((spans) => {
+      if (!spans.length) return null;
+      const rects = spans.map((sp) => sp.getBoundingClientRect());
+      return {
+        left: Math.min(...rects.map((r) => r.left)),
+        right: Math.max(...rects.map((r) => r.right)),
+        height: rects[0].height,
+        text: spans.map((sp) => sp.textContent).join('').trimEnd(),
+        first: spans[0],
+      };
+    });
+    brs.forEach((br, i) => br.replaceWith(lineJoin(boxes[i], boxes[i + 1], boxes.slice(Math.max(0, i - 2), i + 3))));
+  }
+
+  function lineJoin(prev, next, nearby) {
+    if (!prev || !next) return '\n';
+    if (/\p{L}-$/u.test(prev.text)) return '';
+    const lastWord = prev.text.toLowerCase().match(/[\p{L}']+$/u)?.[0];
+    if (lastWord && DANGLING[cfg.source].has(lastWord)) return ' '; // "…se lo dijo a" + "María…"
+    if (/\d$/.test(prev.text)) return '\n'; // page numbers in a table of contents
+    return wrapsOnto(prev, next, nearby) ? ' ' : '\n';
+  }
+
+  // The text wrapped if the space left on the line was too small for the next line's first
+  // word. The right edge comes from the nearby lines (two above, two below) in the same column,
+  // i.e. the paragraph's own width, not wider things elsewhere on the page.
+  function wrapsOnto(prev, next, nearby) {
+    const columnRight = Math.max(...nearby.filter((b) => b && b.left < prev.right && b.right > prev.left).map((b) => b.right));
+    return columnRight - prev.right < firstWordWidth(next.first) + prev.height * 0.4;
+  }
+
+  function firstWordWidth(span) {
+    const node = span.firstChild;
+    const m = node?.nodeType === Node.TEXT_NODE && /\S+/.exec(node.data);
+    if (!m) return 0;
+    const range = document.createRange();
+    range.setStart(node, m.index);
+    range.setEnd(node, m.index + m[0].length);
+    return range.getBoundingClientRect().width;
+  }
+
+  async function zoomPdf(factor) {
+    const current = currentPdfPage();
+    pdfReader.scale = Math.min(4, Math.max(0.4, pdfReader.scale * factor));
+    hideTip();
+    await layoutPdfPages();
+    goToPdfPage(current);
+  }
+
+  function currentPdfPage() {
+    const mid = window.innerHeight / 3;
+    const hit = pdfReader.pages.find((p) => p.div.getBoundingClientRect().bottom > mid);
+    return hit ? +hit.div.dataset.page : 1;
+  }
+
+  function goToPdfPage(n) {
+    const p = pdfReader.pages[Math.min(Math.max(1, n), pdfReader.pages.length) - 1];
+    window.scrollTo({ top: p.div.offsetTop - 56 });
+  }
+
+  // Floating toolbar (inside our shadow root, so its labels aren't translatable words):
+  //   [−] 110% [+]   Page [ 3 ] / 12
+  function pdfToolbar() {
+    const bar = el('div', 'pdfbar');
+    const status = el('span', 'pdfstatus');
+    bar.append(status);
+    shadow.append(bar);
+    return {
+      el: bar,
+      status,
+      ready(total) {
+        const zoomOut = el('button', null, '−');
+        const zoomIn = el('button', null, '+');
+        const zoomLabel = el('span', 'pdfzoom');
+        const pageInput = el('input');
+        pageInput.type = 'number';
+        pageInput.min = 1;
+        pageInput.max = total;
+        const showZoom = () => { zoomLabel.textContent = `${Math.round(pdfReader.scale * 100)}%`; };
+        zoomOut.onclick = () => zoomPdf(1 / PDF_ZOOM_STEP).then(showZoom);
+        zoomIn.onclick = () => zoomPdf(PDF_ZOOM_STEP).then(showZoom);
+        pageInput.onchange = () => goToPdfPage(+pageInput.value);
+        document.addEventListener('keydown', (e) => { // Ctrl +/− zooms the PDF, not the browser
+          if (!(e.ctrlKey || e.metaKey) || !['+', '=', '-'].includes(e.key)) return;
+          e.preventDefault();
+          (e.key === '-' ? zoomOut : zoomIn).click();
+        }, true);
+        let queued = false;
+        window.addEventListener('scroll', () => {
+          if (queued) return;
+          queued = true;
+          requestAnimationFrame(() => { queued = false; if (shadow.activeElement !== pageInput) pageInput.value = currentPdfPage(); });
+        }, { passive: true });
+        pageInput.value = 1;
+        showZoom();
+        status.replaceChildren(zoomOut, zoomLabel, zoomIn, el('span', 'pdfsep'), 'Page ', pageInput, ` / ${total}`);
+      },
+    };
+  }
+
+  const PDF_PAGE_CSS = `
+    .lector-pdf { padding: 56px 0 24px; }
+    .lector-page { position: relative; margin: 0 auto 14px; background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,.4); }
+    .lector-page canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .textLayer { position: absolute; inset: 0; overflow: hidden; line-height: 1; color: transparent;
+      text-align: initial; -webkit-text-size-adjust: none; text-size-adjust: none; forced-color-adjust: none;
+      transform-origin: 0 0; z-index: 2; }
+    .textLayer span { position: absolute; white-space: pre; transform-origin: 0% 0%; cursor: text; color: transparent; }
+    .textLayer ::selection { background: rgba(149, 102, 230, .35); }`;
+
+  // ---------- events ----------
+  function isEditable(t) {
+    return t.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]');
+  }
+
+  function inOurUi(e) {
+    return e.composedPath().includes(host);
+  }
+
+  // While reading mode is on we replace the browser's own (blue) selection:
+  // press + release on a word = translate that word,
+  // press + drag = purple selection snapped to whole words, translated on release.
+  const DRAG_THRESHOLD_PX = 4;
+  let drag = null;           // { x, y, caret, moved, range }
+  let swallowClick = false;  // stops the click after our mouseup from opening links
+
+  document.addEventListener('mousedown', (e) => {
+    swallowClick = false;
+    if (!enabled || e.button !== 0 || inOurUi(e)) return;
+    if (!(e.target instanceof Element) || isEditable(e.target)) return;
+    const caret = caretAt(e.clientX, e.clientY);
+    if (!caret) return;
+    e.preventDefault(); // no native selection, no dragging links/images
+    window.getSelection()?.removeAllRanges();
+    drag = { x: e.clientX, y: e.clientY, caret, moved: false, range: null };
+  }, true);
+
+  document.addEventListener('mouseup', (e) => {
+    if (!drag || e.button !== 0) return;
+    const d = drag;
+    drag = null;
+
+    if (d.moved) {
+      const end = caretAt(e.clientX, e.clientY);
+      const range = (end && wordSpan(d.caret, end)) || d.range;
+      const phrase = range ? range.toString().replace(/\s+/g, ' ').trim() : '';
+      swallowClick = true;
+      if (phrase) lookup(range, phrase); else hideTip();
+      return;
+    }
+
+    const range = wordRangeAt(e.clientX, e.clientY);
+    if (!range) { hideTip(); return; }
+    swallowClick = true;
+    lookup(range, range.toString());
+  }, true);
+
+  document.addEventListener('click', (e) => {
+    if (!swallowClick) return;
+    swallowClick = false;
+    e.preventDefault(); // links don't navigate while reading mode is on
+    e.stopPropagation();
+  }, true);
+
+  // hover: light purple on the word under the mouse
+  let hoverRange = null;
+  let frameQueued = false;
+  let mouseX = 0;
+  let mouseY = 0;
+
+  function clearHover() {
+    hoverRange = null;
+    if (window.CSS?.highlights) CSS.highlights.delete('lector-hover');
+  }
+
+  function sameRange(a, b) {
+    return a && b && a.startContainer === b.startContainer
+      && a.startOffset === b.startOffset && a.endOffset === b.endOffset;
+  }
+
+  function updateHover() {
+    if (!window.CSS?.highlights) return;
+    const range = wordRangeAt(mouseX, mouseY);
+    if (sameRange(range, hoverRange)) return;
+    if (!range) { clearHover(); return; }
+    hoverRange = range;
+    CSS.highlights.set('lector-hover', new Highlight(range));
+  }
+
+  function updateDrag() {
+    const caret = caretAt(mouseX, mouseY);
+    const range = caret && wordSpan(drag.caret, caret);
+    if (!range) return;
+    drag.range = range;
+    markWord(range);
+  }
+
+  function onFrame() {
+    frameQueued = false;
+    if (!enabled) return;
+    if (drag) updateDrag(); else updateHover();
+  }
+
+  document.addEventListener('mousemove', (e) => {
+    if (!enabled) return;
+    mouseX = e.clientX;
+    mouseY = e.clientY;
+    if (drag && !drag.moved) {
+      if (Math.hypot(mouseX - drag.x, mouseY - drag.y) < DRAG_THRESHOLD_PX) return;
+      drag.moved = true;
+      hideTip();
+      clearHover();
+    }
+    if (!drag && (inOurUi(e) || (e.target instanceof Element && isEditable(e.target)))) {
+      clearHover();
+      return;
+    }
+    if (!frameQueued) { frameQueued = true; requestAnimationFrame(onFrame); } // at most once per frame
+  }, { passive: true });
+
+  document.addEventListener('mouseleave', clearHover);
+  window.addEventListener('scroll', clearHover, { passive: true });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === HOTKEY) {
+      e.preventDefault();
+      setEnabled(!enabled);
+    } else if (e.key === 'Escape') {
+      hideTip();
+    }
+  }, true);
+
+  setEnabled(enabled);
+  if (isReaderTab) openPdfReader();
+})();
