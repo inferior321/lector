@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.3.1
+// @version      1.3.2
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, a PDF reader and a pasted-text reader. Alt+T toggles reading mode.
 // @author       inferior321
 // @license      MIT
@@ -65,7 +65,7 @@
   // capped so it can't grow forever. Bump CACHE_KEY if the stored format changes.
   // Loaded on the first lookup, not on every page load (most pages never translate anything).
   const CACHE_KEY = 'translationCache-v1';
-  const CACHE_MAX_ENTRIES = 2000;
+  const CACHE_MAX_ENTRIES = 5000;
   let googleCache = null;
   let googlePausedUntil = 0; // set only while every Google address is refusing (badge / popup countdown)
   let cacheSaveTimer = 0;
@@ -971,7 +971,7 @@
   // PDF.js's fingerprint (the document ID built into the file), so renaming or re-saving a
   // PDF keeps its place.
   const PDF_PAGES_KEY = 'pdfPages';
-  const MAX_PDF_PAGES = 50;
+  const MAX_PDF_PAGES = 500;
 
   // A normal browser tab: the file picker doesn't open in tabs made by Tampermonkey's
   // GM_openInTab, so don't switch to that.
