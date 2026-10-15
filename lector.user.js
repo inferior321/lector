@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.3.2
-// @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, a PDF reader and a pasted-text reader. Alt+T toggles reading mode.
+// @version      1.4.0
+// @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode.
 // @author       inferior321
 // @license      MIT
 // @homepageURL  https://github.com/inferior321/lector
@@ -32,7 +32,7 @@
 
   // ---------- menu (registered first so it shows up even if a page breaks the UI code) ----------
   GM_registerMenuCommand('Toggle reading mode (Alt+T)', () => setEnabled(!enabled));
-  GM_registerMenuCommand('Open a PDF to read…', () => (isReaderTab ? openPdfReader() : openReaderTab(READER_URL)));
+  GM_registerMenuCommand('Open a PDF or EPUB to read…', () => (isReaderTab ? openBookReader() : openReaderTab(READER_URL)));
   GM_registerMenuCommand('Read pasted text…', () => (isTextTab ? openTextReader() : openReaderTab(TEXT_READER_URL)));
   GM_registerMenuCommand('Swap direction (Spanish ⇄ English)', () => {
     GM_setValue('reversed', !cfg.reversed);
@@ -584,8 +584,9 @@
       .readerstatus { display: flex; align-items: center; gap: 6px; }
       .readerbar button { all: unset; cursor: pointer; padding: 1px 9px; border-radius: 5px; background: #343b4b; }
       .readerbar button:hover { background: #46506a; }
-      .readerbar input { width: 3.2em; background: #2a3040; color: #f2f2f2; border: 1px solid #46506a;
+      .readerbar input, .readerbar select { width: 3.2em; background: #2a3040; color: #f2f2f2; border: 1px solid #46506a;
         border-radius: 4px; padding: 1px 4px; font: inherit; }
+      .readerbar select { width: auto; max-width: 16em; }
       .pdfzoom { min-width: 3.2em; text-align: center; }
       .pdfsep { width: 10px; }
       .badge { position: fixed; bottom: 12px; right: 12px; background: #6a3fb5; color: #fff;
@@ -957,21 +958,19 @@
     if (busy) badgeTimer = setTimeout(updateBadge, 1000);
   }
 
-  // ---------- PDF reader ----------
-  // Brave's own PDF viewer can't be reached by userscripts, so PDFs are opened from the menu
-  // ("Open a PDF to read…"). That opens a reader tab on example.com: a plain page with no
-  // security rules (many big sites, e.g. Google, block the code PDF.js needs). There you pick
-  // a file; PDF.js (downloaded once, then kept in Tampermonkey's storage) draws each page on a
-  // canvas with an invisible text layer on top, and the normal hover/click/drag code works on
-  // that text.
-  const READER_URL = 'https://example.com/#lector-pdf';
-  const isReaderTab = location.hostname === 'example.com' && location.hash === '#lector-pdf';
+  // ---------- book reader (PDF / EPUB) ----------
+  // Brave's own PDF viewer can't be reached by userscripts, so books are opened from the menu
+  // ("Open a PDF or EPUB to read…"). That opens a reader tab on example.com: a plain page with
+  // no security rules (many big sites, e.g. Google, block the code PDF.js needs). There you
+  // pick a file and the tab becomes the reader; the normal hover/click/drag code works on it.
+  const READER_URL = 'https://example.com/#lector-book';
+  const isReaderTab = location.hostname === 'example.com' && location.hash === '#lector-book';
   const PDF_ZOOM_STEP = 1.15;
-  // Last page read in each PDF, newest last; the oldest are dropped. PDFs are told apart by
-  // PDF.js's fingerprint (the document ID built into the file), so renaming or re-saving a
-  // PDF keeps its place.
-  const PDF_PAGES_KEY = 'pdfPages';
-  const MAX_PDF_PAGES = 500;
+  // Where you were in each book, newest last; the oldest are dropped. Books are told apart by
+  // the ID built into the file (PDF.js's fingerprint, the EPUB's identifier), so renaming a
+  // file keeps its place.
+  const READING_PLACES_KEY = 'readingPlaces';
+  const MAX_READING_PLACES = 500;
 
   // A normal browser tab: the file picker doesn't open in tabs made by Tampermonkey's
   // GM_openInTab, so don't switch to that.
@@ -992,42 +991,73 @@
     window.scrollTo(0, 0);
   }
 
-  function savedPdfPage(key) {
-    return GM_getValue(PDF_PAGES_KEY, {})[key] || 1;
+  function savedPlace(key) {
+    return GM_getValue(READING_PLACES_KEY, {})[key];
   }
 
-  function savePdfPage(key, page) {
-    const all = GM_getValue(PDF_PAGES_KEY, {});
+  function savePlace(key, place) {
+    const all = GM_getValue(READING_PLACES_KEY, {});
     delete all[key];
-    all[key] = page;
+    all[key] = place;
     const keys = Object.keys(all);
-    for (const k of keys.slice(0, keys.length - MAX_PDF_PAGES)) delete all[k];
-    GM_setValue(PDF_PAGES_KEY, all);
+    for (const k of keys.slice(0, keys.length - MAX_READING_PLACES)) delete all[k];
+    GM_setValue(READING_PLACES_KEY, all);
   }
 
-  let pdfjs = null;
-  let pdfReader = null; // { doc, scale, pages: [{ div, rendered }], observer, fileKey }
+  let bookOpen = false;
 
-  async function openPdfReader() {
-    if (pdfReader) return;
-    pdfReader = { doc: null, scale: 1, pages: [] };
-    const bar = pdfToolbar();
-    let file;
+  async function openBookReader() {
+    if (bookOpen) return;
+    bookOpen = true;
+    const bar = readerBar();
     try {
-      file = await pickPdfFile(bar);
-      bar.status.textContent = 'Loading PDF…';
-      // isEvalSupported: false closes CVE-2024-4367 (a crafted PDF could run code via font eval
-      // in PDF.js ≤ 4.1.392, which includes the 3.11 build used here).
+      const file = await pickBookFile(bar);
+      bar.status.textContent = `Loading ${file.name}…`;
       const data = new Uint8Array(await file.arrayBuffer());
-      pdfReader.doc = await (await loadPdfJs()).getDocument({ data, isEvalSupported: false }).promise;
+      const isZip = data[0] === 0x50 && data[1] === 0x4b; // "PK": EPUBs are zip files
+      await (isZip ? openEpub : openPdf)(file, data, bar);
     } catch (e) {
-      bar.status.textContent = `Couldn't open PDF: ${e.message}`;
-      pdfReader = null;
+      bar.status.textContent = `Couldn't open the file: ${e.message}`;
+      bookOpen = false;
       setTimeout(() => bar.el.remove(), 6000);
-      return;
     }
+  }
 
-    pdfReader.fileKey = pdfReader.doc.fingerprints[0];
+  function pickBookFile(bar) {
+    return new Promise((resolve, reject) => {
+      const input = el('input');
+      input.type = 'file';
+      input.accept = 'application/pdf,.pdf,application/epub+zip,.epub';
+      input.onchange = () => (input.files[0] ? resolve(input.files[0]) : reject(new Error('no file chosen')));
+      const choose = el('button', null, 'Choose file…');
+      const cancel = el('button', null, 'Cancel');
+      choose.onclick = () => input.click();
+      cancel.onclick = () => reject(new Error('cancelled'));
+      bar.status.replaceChildren('Open a PDF or EPUB to read:', choose, cancel);
+    });
+  }
+
+  // Ctrl +/− zooms the book, not the browser.
+  function zoomKeys(zoomOut, zoomIn) {
+    document.addEventListener('keydown', (e) => {
+      if (!(e.ctrlKey || e.metaKey) || !['+', '=', '-'].includes(e.key)) return;
+      e.preventDefault();
+      (e.key === '-' ? zoomOut : zoomIn).click();
+    }, true);
+  }
+
+  // ---------- PDF ----------
+  // PDF.js (downloaded once, then kept in Tampermonkey's storage) draws each page on a canvas
+  // with an invisible text layer on top.
+  let pdfjs = null;
+  let pdfReader = null; // { doc, scale, pages: [{ div, rendered }], observer, placeKey }
+
+  async function openPdf(file, data, bar) {
+    pdfReader = { doc: null, scale: 1, pages: [] };
+    // isEvalSupported: false closes CVE-2024-4367 (a crafted PDF could run code via font eval
+    // in PDF.js ≤ 4.1.392, which includes the 3.11 build used here).
+    pdfReader.doc = await (await loadPdfJs()).getDocument({ data, isEvalSupported: false }).promise;
+    pdfReader.placeKey = pdfReader.doc.fingerprints[0];
     takeOverPage(file.name, PDF_PAGE_CSS, '#525659');
     const container = el('div', 'lector-pdf');
     document.body.prepend(container);
@@ -1045,8 +1075,8 @@
       for (const entry of entries) if (entry.isIntersecting) renderPdfPage(+entry.target.dataset.page);
     }, { rootMargin: '1200px 0px' });
     await layoutPdfPages();
-    goToPdfPage(savedPdfPage(pdfReader.fileKey)); // carry on where you left off
-    bar.ready(pdfReader.doc.numPages);
+    goToPdfPage(savedPlace(pdfReader.placeKey) || 1); // carry on where you left off
+    pdfControls(bar, pdfReader.doc.numPages);
     setEnabled(true);
   }
 
@@ -1077,20 +1107,6 @@
     const code = await res.text();
     GM_setValue(key, code);
     return code;
-  }
-
-  function pickPdfFile(bar) {
-    return new Promise((resolve, reject) => {
-      const input = el('input');
-      input.type = 'file';
-      input.accept = 'application/pdf,.pdf';
-      input.onchange = () => (input.files[0] ? resolve(input.files[0]) : reject(new Error('no file chosen')));
-      const choose = el('button', null, 'Choose PDF…');
-      const cancel = el('button', null, 'Cancel');
-      choose.onclick = () => input.click();
-      cancel.onclick = () => reject(new Error('cancelled'));
-      bar.status.replaceChildren('Open a PDF to read:', choose, cancel);
-    });
   }
 
   // Size every page placeholder for the current zoom; pages are only drawn near the screen.
@@ -1199,9 +1215,8 @@
     window.scrollTo({ top: p.div.offsetTop - 56 });
   }
 
-  // Floating toolbar (inside our shadow root, so its labels aren't translatable words):
-  //   [−] 110% [+]   Page [ 3 ] / 12
-  // Floating bar at the top of a reader tab (PDF or pasted text).
+  // Floating bar at the top of a reader tab (inside our shadow root, so its labels aren't
+  // translatable words).
   function readerBar() {
     const bar = el('div', 'readerbar');
     const status = el('span', 'readerstatus');
@@ -1210,45 +1225,35 @@
     return { el: bar, status };
   }
 
-  function pdfToolbar() {
-    const { el: bar, status } = readerBar();
-    return {
-      el: bar,
-      status,
-      ready(total) {
-        const zoomOut = el('button', null, '−');
-        const zoomIn = el('button', null, '+');
-        const zoomLabel = el('span', 'pdfzoom');
-        const pageInput = el('input');
-        pageInput.type = 'number';
-        pageInput.min = 1;
-        pageInput.max = total;
-        const showZoom = () => { zoomLabel.textContent = `${Math.round(pdfReader.scale * 100)}%`; };
-        zoomOut.onclick = () => zoomPdf(1 / PDF_ZOOM_STEP).then(showZoom);
-        zoomIn.onclick = () => zoomPdf(PDF_ZOOM_STEP).then(showZoom);
-        pageInput.onchange = () => goToPdfPage(+pageInput.value);
-        document.addEventListener('keydown', (e) => { // Ctrl +/− zooms the PDF, not the browser
-          if (!(e.ctrlKey || e.metaKey) || !['+', '=', '-'].includes(e.key)) return;
-          e.preventDefault();
-          (e.key === '-' ? zoomOut : zoomIn).click();
-        }, true);
-        let queued = false;
-        let lastPage = currentPdfPage();
-        window.addEventListener('scroll', () => {
-          if (queued) return;
-          queued = true;
-          requestAnimationFrame(() => {
-            queued = false;
-            const page = currentPdfPage();
-            if (shadow.activeElement !== pageInput) pageInput.value = page;
-            if (page !== lastPage) savePdfPage(pdfReader.fileKey, (lastPage = page));
-          });
-        }, { passive: true });
-        pageInput.value = lastPage;
-        showZoom();
-        status.replaceChildren(zoomOut, zoomLabel, zoomIn, el('span', 'pdfsep'), 'Page ', pageInput, ` / ${total}`);
-      },
-    };
+  //   [−] 110% [+]   Page [ 3 ] / 12
+  function pdfControls(bar, total) {
+    const zoomOut = el('button', null, '−');
+    const zoomIn = el('button', null, '+');
+    const zoomLabel = el('span', 'pdfzoom');
+    const pageInput = el('input');
+    pageInput.type = 'number';
+    pageInput.min = 1;
+    pageInput.max = total;
+    const showZoom = () => { zoomLabel.textContent = `${Math.round(pdfReader.scale * 100)}%`; };
+    zoomOut.onclick = () => zoomPdf(1 / PDF_ZOOM_STEP).then(showZoom);
+    zoomIn.onclick = () => zoomPdf(PDF_ZOOM_STEP).then(showZoom);
+    pageInput.onchange = () => goToPdfPage(+pageInput.value);
+    zoomKeys(zoomOut, zoomIn);
+    let queued = false;
+    let lastPage = currentPdfPage();
+    window.addEventListener('scroll', () => {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => {
+        queued = false;
+        const page = currentPdfPage();
+        if (shadow.activeElement !== pageInput) pageInput.value = page;
+        if (page !== lastPage) savePlace(pdfReader.placeKey, (lastPage = page));
+      });
+    }, { passive: true });
+    pageInput.value = lastPage;
+    showZoom();
+    bar.status.replaceChildren(zoomOut, zoomLabel, zoomIn, el('span', 'pdfsep'), 'Page ', pageInput, ` / ${total}`);
   }
 
   const PDF_PAGE_CSS = `
@@ -1260,6 +1265,214 @@
       transform-origin: 0 0; z-index: 2; }
     .textLayer span { position: absolute; white-space: pre; transform-origin: 0% 0%; cursor: text; color: transparent; }
     .textLayer ::selection { background: rgba(149, 102, 230, .35); }`;
+
+  // ---------- EPUB ----------
+  // An EPUB is a zip of web pages (one or more per chapter) plus an index saying in which order
+  // to read them. The zip is unpacked with the browser's own decompressor, and each chapter is
+  // rebuilt from plain text-formatting tags only: no scripts, styles, links or event handlers,
+  // so a book can't run code here or restyle the reader. All chapters go on one long page.
+  const EPUB_FONT_PX = 20;
+  const EPUB_ZOOM_STEP = 1.1;
+  const EPUB_SAVE_DELAY_MS = 1000;
+  const EPUB_TOP_PX = 80; // the reading line, just below the toolbar
+  // Tags kept as they are; any other tag is dropped but its contents kept (links become text).
+  const EPUB_TAGS = new Set(['p', 'div', 'section', 'article', 'aside', 'header', 'footer', 'main', 'nav',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'ul', 'ol', 'li', 'dl', 'dt', 'dd', 'table', 'thead',
+    'tbody', 'tfoot', 'tr', 'td', 'th', 'caption', 'figure', 'figcaption', 'pre', 'code', 'em', 'i', 'b',
+    'strong', 'u', 's', 'small', 'sub', 'sup', 'span', 'abbr', 'cite', 'q', 'br', 'hr', 'img', 'ruby', 'rt', 'rp']);
+  // Tags dropped together with their contents.
+  const EPUB_DROP = new Set(['script', 'style', 'head', 'title', 'svg', 'math', 'iframe', 'object', 'embed',
+    'video', 'audio', 'canvas', 'form', 'input', 'button', 'select', 'textarea', 'noscript', 'template', 'link', 'meta']);
+  let epubReader = null; // { container, chapters: [section], scale, placeKey }
+
+  async function openEpub(file, data, bar) {
+    const zip = readZip(data);
+    const container = parseXml(await zipText(zip, 'META-INF/container.xml'), 'application/xml');
+    const opfPath = container.querySelector('rootfile')?.getAttribute('full-path');
+    if (!opfPath) throw new Error('not an EPUB (no book index)');
+    const opf = parseXml(await zipText(zip, opfPath), 'application/xml');
+    const byTag = (tag) => [...opf.getElementsByTagNameNS('*', tag)];
+    const manifest = new Map(byTag('item').map((i) => [i.getAttribute('id'), i]));
+    const types = new Map(byTag('item').map((i) => [zipPath(opfPath, i.getAttribute('href')), i.getAttribute('media-type')]));
+    const spine = byTag('itemref').map((r) => manifest.get(r.getAttribute('idref')))
+      .filter((i) => i && /html/.test(i.getAttribute('media-type')))
+      .map((i) => zipPath(opfPath, i.getAttribute('href')));
+    if (!spine.length) throw new Error('this EPUB has no readable chapters');
+
+    const uniqueId = opf.documentElement.getAttribute('unique-identifier');
+    const identifier = byTag('identifier').find((i) => i.getAttribute('id') === uniqueId) || byTag('identifier')[0];
+    const id = identifier?.textContent.trim() || await sha256(data);
+    const title = byTag('title')[0]?.textContent.trim() || file.name;
+
+    const book = el('div', 'lector-book');
+    const chapters = [];
+    for (const path of spine) {
+      const doc = parseXml(await zipText(zip, path), 'application/xhtml+xml');
+      const section = el('section', 'lector-chapter');
+      const images = [];
+      for (const n of [...(doc.body || doc.documentElement).childNodes]) {
+        const copy = copyEpubNode(n, path, images);
+        if (copy) section.append(copy);
+      }
+      await Promise.all(images.map(async ([img, src]) => {
+        try {
+          img.src = URL.createObjectURL(new Blob([await zipBytes(zip, src)], { type: types.get(src) || '' }));
+        } catch { img.remove(); }
+      }));
+      if (section.textContent.trim() || section.querySelector('img')) chapters.push(section);
+    }
+
+    takeOverPage(title, EPUB_PAGE_CSS, '#faf8f4');
+    book.append(...chapters);
+    document.body.prepend(book);
+    // wait for images, so the page has its final height before jumping to the saved place
+    await Promise.all([...book.querySelectorAll('img')].map((img) => img.decode().catch(() => {})));
+    epubReader = { container: book, chapters, scale: 1, placeKey: `epub:${id}` };
+    goToEpubPlace(savedPlace(epubReader.placeKey));
+    epubControls(bar);
+    setEnabled(true);
+  }
+
+  // Minimal zip reader: the index at the end of the file lists every file and where it starts.
+  function readZip(data) {
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    let end = data.length - 22;
+    while (end >= 0 && view.getUint32(end, true) !== 0x06054b50) end--;
+    if (end < 0) throw new Error('damaged file (no zip index)');
+    const entries = new Map();
+    const decoder = new TextDecoder();
+    let p = view.getUint32(end + 16, true);
+    for (let i = view.getUint16(end + 10, true); i > 0; i--) {
+      if (view.getUint32(p, true) !== 0x02014b50) throw new Error('damaged file (bad zip index)');
+      const nameLength = view.getUint16(p + 28, true);
+      entries.set(decoder.decode(data.subarray(p + 46, p + 46 + nameLength)), {
+        method: view.getUint16(p + 10, true),
+        size: view.getUint32(p + 20, true),
+        header: view.getUint32(p + 42, true),
+      });
+      p += 46 + nameLength + view.getUint16(p + 30, true) + view.getUint16(p + 32, true);
+    }
+    return { data, view, entries };
+  }
+
+  async function zipBytes(zip, name) {
+    const entry = zip.entries.get(name);
+    if (!entry) throw new Error(`missing ${name}`);
+    const { view } = zip;
+    const start = entry.header + 30 + view.getUint16(entry.header + 26, true) + view.getUint16(entry.header + 28, true);
+    const raw = zip.data.subarray(start, start + entry.size);
+    if (entry.method === 0) return raw; // stored as is
+    if (entry.method !== 8) throw new Error(`unsupported compression in ${name}`);
+    const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  async function zipText(zip, name) {
+    return new TextDecoder().decode(await zipBytes(zip, name));
+  }
+
+  // Path inside the zip of a link found in the file at `from` (links are relative and %-encoded).
+  function zipPath(from, href) {
+    return decodeURIComponent(new URL(href, `https://zip/${from}`).pathname.slice(1));
+  }
+
+  function parseXml(text, type) {
+    const doc = new DOMParser().parseFromString(text, type);
+    if (!doc.querySelector('parsererror')) return doc;
+    return new DOMParser().parseFromString(text, 'text/html'); // sloppy XHTML: read it as HTML
+  }
+
+  async function sha256(data) {
+    const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+    return [...hash].map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  // Copy of a chapter node made of safe tags only (see EPUB_TAGS); images are queued in
+  // `images` to be filled in from the zip.
+  function copyEpubNode(node, path, images) {
+    if (node.nodeType === Node.TEXT_NODE) return document.createTextNode(node.data);
+    if (node.nodeType !== Node.ELEMENT_NODE) return null;
+    const tag = node.localName.toLowerCase();
+    if (EPUB_DROP.has(tag)) return null;
+    if (tag === 'img') {
+      const src = node.getAttribute('src');
+      if (!src) return null;
+      const img = el('img');
+      img.alt = node.getAttribute('alt') || '';
+      images.push([img, zipPath(path, src)]);
+      return img;
+    }
+    const copy = EPUB_TAGS.has(tag) ? document.createElement(tag) : document.createDocumentFragment();
+    for (const child of node.childNodes) {
+      const c = copyEpubNode(child, path, images);
+      if (c) copy.append(c);
+    }
+    return copy;
+  }
+
+  // Where you are: [chapter number, how far through it (0–1)] at the reading line. Stored this
+  // way (not as a scroll position) so it still fits after the text size or window changes.
+  function epubPlace() {
+    const line = window.scrollY + EPUB_TOP_PX;
+    const { chapters } = epubReader;
+    let i = chapters.length - 1;
+    while (i > 0 && chapters[i].offsetTop > line) i--;
+    const c = chapters[i];
+    return [i, Math.round(Math.min(1, Math.max(0, (line - c.offsetTop) / c.offsetHeight)) * 10000) / 10000];
+  }
+
+  function goToEpubPlace(place) {
+    if (!place) return;
+    const c = epubReader.chapters[Math.min(place[0], epubReader.chapters.length - 1)];
+    window.scrollTo({ top: c.offsetTop + place[1] * c.offsetHeight - EPUB_TOP_PX });
+  }
+
+  //   [−] 100% [+]   [ Chapter 3: El viaje ▾ ]
+  function epubControls(bar) {
+    const zoomOut = el('button', null, '−');
+    const zoomIn = el('button', null, '+');
+    const zoomLabel = el('span', 'pdfzoom');
+    const chapterPicker = el('select');
+    epubReader.chapters.forEach((c, i) => {
+      const heading = c.querySelector('h1, h2, h3, h4')?.textContent.replace(/\s+/g, ' ').trim();
+      chapterPicker.append(Object.assign(el('option', null, heading ? heading.slice(0, 60) : `Section ${i + 1}`), { value: i }));
+    });
+    const showZoom = () => { zoomLabel.textContent = `${Math.round(epubReader.scale * 100)}%`; };
+    const zoom = (factor) => {
+      const place = epubPlace();
+      epubReader.scale = Math.min(2.5, Math.max(0.6, epubReader.scale * factor));
+      epubReader.container.style.fontSize = `${EPUB_FONT_PX * epubReader.scale}px`;
+      hideTip();
+      goToEpubPlace(place);
+      showZoom();
+    };
+    zoomOut.onclick = () => zoom(1 / EPUB_ZOOM_STEP);
+    zoomIn.onclick = () => zoom(EPUB_ZOOM_STEP);
+    chapterPicker.onchange = () => goToEpubPlace([+chapterPicker.value, 0]);
+    zoomKeys(zoomOut, zoomIn);
+    let queued = false;
+    let saveTimer = 0;
+    window.addEventListener('scroll', () => {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => savePlace(epubReader.placeKey, epubPlace()), EPUB_SAVE_DELAY_MS);
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; chapterPicker.value = epubPlace()[0]; });
+    }, { passive: true });
+    chapterPicker.value = epubPlace()[0];
+    showZoom();
+    bar.status.replaceChildren(zoomOut, zoomLabel, zoomIn, el('span', 'pdfsep'), chapterPicker);
+  }
+
+  const EPUB_PAGE_CSS = `
+    .lector-book { max-width: 38em; margin: 0 auto; padding: 64px 24px 48px; color: #222;
+      font: ${EPUB_FONT_PX}px/1.6 Georgia, serif; }
+    .lector-chapter + .lector-chapter { border-top: 1px solid #ddd; margin-top: 2em; padding-top: 2em; }
+    .lector-book h1, .lector-book h2, .lector-book h3 { line-height: 1.3; }
+    .lector-book img { max-width: 100%; height: auto; }
+    .lector-book pre { white-space: pre-wrap; }
+    .lector-book table { border-collapse: collapse; }
+    .lector-book td, .lector-book th { border: 1px solid #ccc; padding: 4px 8px; }`;
 
   // ---------- text reader ----------
   // "Read pasted text…" opens a tab on example.com (like the PDF reader). Pasting anywhere in
@@ -1437,6 +1650,6 @@
   }, true);
 
   setEnabled(enabled);
-  if (isReaderTab) openPdfReader();
+  if (isReaderTab) openBookReader();
   if (isTextTab) openTextReader();
 })();
