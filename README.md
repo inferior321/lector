@@ -20,9 +20,9 @@ Tampermonkey checks this address for new versions and updates the script by itse
 | **Click a word** | Translate it in context |
 | **Drag across words** | Translate a phrase (the selection snaps to whole words) |
 | **Esc** | Close the popup |
-| | Words and phrases you've looked up get a dotted purple underline everywhere they appear on the page, until you reload (shown only in reading mode) |
-| Tampermonkey menu → **Open a PDF or EPUB to read…** | Opens a reader tab: pick a PDF or EPUB book and read it with the same click-to-translate. Your last 5 books are listed under **Continue reading** and reopen with one click, at the same spot and zoom. A chapter list follows the book's own table of contents (or the PDF's outline) |
-| Tampermonkey menu → **Read pasted text…** | Opens a reader tab: press Ctrl+V and the text (an email, a message, a site where clicking doesn't work) is ready to click right away. A new paste replaces it; reloading the tab keeps it |
+| | Words and phrases you've looked up get a dotted purple underline everywhere they appear on the page (shown only in reading mode). On web pages they clear when you reload; in the reader tabs they last until you close the tab |
+| Tampermonkey menu → **Open a PDF or EPUB to read…** | Opens a reader tab: pick a PDF or EPUB book and read it with the same click-to-translate. Your last 5 books are listed under **Continue reading** and reopen with one click, at the same spot and zoom; reloading the tab reopens the book you were reading. A chapter list follows the book's own table of contents (or the PDF's outline) |
+| Tampermonkey menu → **Read pasted text…** | Opens a reader tab with a box at the top: paste or type any text (an email, a message, a site where clicking doesn't work) and it appears below, ready to click. Edits show up as soon as you pause typing; Ctrl+V anywhere on the page replaces the text |
 | Tampermonkey menu → **Swap direction** | Spanish → English (default) or English → Spanish |
 
 ### The popup

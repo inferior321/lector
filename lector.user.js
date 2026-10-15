@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.5.0
+// @version      1.6.0
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode.
 // @author       inferior321
 // @license      MIT
@@ -39,6 +39,14 @@
     hideTip();
     setEnabled(enabled); // refresh badge text
   });
+
+  // The tab's own storage: kept across reloads, forgotten when the tab closes. Used by the
+  // reader tabs (reload = back where you were); may be blocked, in which case nothing is kept.
+  const tabStore = {
+    get(key) { try { return sessionStorage.getItem(key); } catch { return null; } },
+    set(key, value) { try { sessionStorage.setItem(key, value); } catch { /* blocked */ } },
+    remove(key) { try { sessionStorage.removeItem(key); } catch { /* blocked */ } },
+  };
 
   const GOOGLE_BACKOFF_MS = 120_000;
   const MAX_SENTENCE_CHARS = 600;
@@ -646,13 +654,14 @@
   }
 
   // Dotted underline on every word/phrase looked up since the page loaded, wherever it appears
-  // on the page (capitals ignored, accents not). Kept in memory only and shown only in reading
-  // mode; text added later (infinite scroll, PDF pages) gets marked too. In an EPUB only the
+  // on the page (capitals ignored, accents not). Kept in memory only (reader tabs: in the tab's
+  // storage, so a reload keeps them) and shown only in reading mode; text added later (infinite scroll, PDF pages) gets marked too. In an EPUB only the
   // text around the screen is marked (redone as you scroll), so a long book costs no more than
   // a short one; a PDF only has text for the few pages currently drawn anyway.
   const seen = new Set();
   const SEEN_RESCAN_MS = 300;
   const SEEN_WINDOW_CHARS = 40_000; // EPUB: text marked on each side of the screen's middle
+  const SEEN_TAB_KEY = 'lector-seen';
   const NO_TEXT_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'TEMPLATE']);
   let seenTimer = 0;
   const seenObserver = new MutationObserver(() => queueMarkSeen());
@@ -666,7 +675,15 @@
     if (!key || seen.has(key)) return;
     seen.add(key);
     if (seen.size === 1) seenObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+    if (isReaderTab || isTextTab) tabStore.set(SEEN_TAB_KEY, JSON.stringify([...seen])); // reader tabs keep them across a reload
     markSeen();
+  }
+
+  function restoreSeen() {
+    let saved = [];
+    try { saved = JSON.parse(tabStore.get(SEEN_TAB_KEY)) || []; } catch { /* nothing usable saved */ }
+    for (const key of saved) seen.add(key);
+    if (seen.size) seenObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
   }
 
   function seenTextNodes() {
@@ -1015,6 +1032,7 @@
   // (IndexedDB on example.com, on this computer only), so they reopen without the file picker.
   const BOOKS_DB = 'lector-books';
   const MAX_RECENT_BOOKS = 5;
+  const TAB_BOOK_KEY = 'lector-book'; // the book open in this tab, so a reload reopens it
 
   // A normal browser tab: the file picker doesn't open in tabs made by Tampermonkey's
   // GM_openInTab, so don't switch to that.
@@ -1072,7 +1090,10 @@
     }
   }
 
+  // Called once a book has opened: keep its file for the recent list, and note it as this
+  // tab's book.
   async function rememberBook(key, title, blob) {
+    tabStore.set(TAB_BOOK_KEY, key);
     try {
       await booksStore('readwrite', (store) => store.put({ key, title, blob, opened: Date.now() }));
       const extra = (await recentBooks()).slice(MAX_RECENT_BOOKS);
@@ -1091,13 +1112,16 @@
     bookOpen = true;
     const bar = readerBar();
     try {
-      const book = await chooseBook(bar, await recentBooks());
+      const recent = await recentBooks();
+      const reloaded = recent.find((b) => b.key === tabStore.get(TAB_BOOK_KEY));
+      const book = reloaded ? { name: reloaded.title, blob: reloaded.blob } : await chooseBook(bar, recent);
       bar.el.querySelector('.recent')?.remove();
       bar.status.textContent = `Loading ${book.name}…`;
       const data = new Uint8Array(await book.blob.arrayBuffer());
       const isZip = data[0] === 0x50 && data[1] === 0x4b; // "PK": EPUBs are zip files
       await (isZip ? openEpub : openPdf)(book, data, bar);
     } catch (e) {
+      tabStore.remove(TAB_BOOK_KEY); // don't retry a broken book on every reload
       bar.el.querySelector('.recent')?.remove();
       bar.status.textContent = `Couldn't open the file: ${e.message}`;
       bookOpen = false;
@@ -1750,43 +1774,73 @@
     .lector-book td, .lector-book th { border: 1px solid #ccc; padding: 4px 8px; }`;
 
   // ---------- text reader ----------
-  // "Read pasted text…" opens a tab on example.com (like the PDF reader). Pasting anywhere in
-  // it (Ctrl+V or right-click → Paste) shows the text as plain paragraphs with the usual
-  // click-to-translate; a new paste replaces it. The text is kept in the tab's sessionStorage,
-  // so reloading brings it back and closing the tab forgets it.
+  // "Read pasted text…" opens a tab on example.com (like the book reader): a box at the top to
+  // paste or type into, and the same text below as paragraphs with the usual click-to-translate.
+  // The text below follows the box right after a paste, or once you pause typing, and only the
+  // paragraphs that changed are redrawn, so your place, underlines and an open popup stay put.
+  // Ctrl+V anywhere outside the box replaces the box's text. The text is kept in the tab's
+  // storage: reloading brings it back, closing the tab forgets it.
   const TEXT_READER_URL = 'https://example.com/#lector-text';
   const isTextTab = location.hostname === 'example.com' && location.hash === '#lector-text';
   const TEXT_STORE_KEY = 'lector-text';
-  let textReader = null; // { container, bar }
+  const TEXT_TYPING_PAUSE_MS = 500;
+  let textReader = null; // { box, view, paragraphs }
 
   function openTextReader() {
-    if (!textReader) {
-      takeOverPage('Lector: pasted text', TEXT_PAGE_CSS, '#faf8f4');
-      textReader = { container: el('div', 'lector-text'), bar: readerBar() };
-      textReader.bar.status.textContent = 'Ctrl+V replaces the text';
-      document.body.prepend(textReader.container);
-      document.addEventListener('paste', (e) => {
-        const text = e.clipboardData?.getData('text/plain') || '';
-        if (!text.trim()) return;
-        e.preventDefault();
-        try { sessionStorage.setItem(TEXT_STORE_KEY, text); } catch { /* storage blocked: just don't keep it */ }
-        showPastedText(text);
-      });
-    }
-    let saved = '';
-    try { saved = sessionStorage.getItem(TEXT_STORE_KEY) || ''; } catch { /* storage blocked */ }
-    showPastedText(saved);
+    if (textReader) { textReader.box.focus(); return; }
+    takeOverPage('Lector: pasted text', TEXT_PAGE_CSS, '#faf8f4');
+    const box = el('textarea', 'lector-paste');
+    box.placeholder = 'Paste or type the text you want to read (Ctrl+V works anywhere on the page)';
+    box.spellcheck = false; // the browser's checker would underline every Spanish word in red
+    const top = el('div', 'lector-pastebar');
+    top.append(box);
+    const view = el('div', 'lector-text');
+    document.body.prepend(top, view);
+    textReader = { box, view, paragraphs: [] };
+
+    let typingTimer = 0;
+    box.addEventListener('input', (e) => {
+      clearTimeout(typingTimer);
+      if (/^insertFrom(Paste|Drop)/.test(e.inputType)) updateTextView();
+      else typingTimer = setTimeout(updateTextView, TEXT_TYPING_PAUSE_MS);
+    });
+    document.addEventListener('paste', (e) => { // outside the box: replace the box's text
+      if (e.target === box) return;
+      const text = e.clipboardData?.getData('text/plain') || '';
+      if (!text.trim()) return;
+      e.preventDefault();
+      box.value = text;
+      updateTextView();
+      window.scrollTo(0, 0);
+    });
+    box.value = tabStore.get(TEXT_STORE_KEY) || '';
+    updateTextView();
+    if (!box.value) box.focus();
   }
 
-  function showPastedText(text) {
-    const paragraphs = textParagraphs(text);
-    hideTip();
-    textReader.container.replaceChildren(...(paragraphs.length
-      ? paragraphs.map((p) => el('p', null, p))
-      : [el('div', 'lector-hint', 'Press Ctrl+V to paste the text you want to read')]));
-    textReader.bar.el.style.display = paragraphs.length ? '' : 'none';
-    window.scrollTo(0, 0);
-    setEnabled(paragraphs.length > 0);
+  function updateTextView() {
+    const { box, view, paragraphs: old } = textReader;
+    tabStore.set(TEXT_STORE_KEY, box.value);
+    const next = textParagraphs(box.value);
+    // the paragraphs that stayed the same at the start and at the end are left alone
+    let same = 0;
+    while (same < old.length && same < next.length && old[same] === next[same]) same++;
+    let sameEnd = 0;
+    while (sameEnd < old.length - same && sameEnd < next.length - same
+      && old[old.length - 1 - sameEnd] === next[next.length - 1 - sameEnd]) sameEnd++;
+    const shown = [...view.children];
+    const gone = shown.slice(same, old.length - sameEnd);
+    const added = next.slice(same, next.length - sameEnd).map((t) => el('p', null, t));
+    const popupWord = window.CSS?.highlights?.get('lector-word');
+    if (popupWord && gone.some((p) => [...popupWord].some((r) => p.contains(r.startContainer)))) hideTip();
+    if (added.length) {
+      const before = shown[old.length - sameEnd];
+      if (before) before.before(...added); else view.append(...added);
+    }
+    for (const p of gone) p.remove();
+    textReader.paragraphs = next;
+    if (!old.length && next.length) setEnabled(true); // text arrived: ready to click
+    if (old.length && !next.length) setEnabled(false);
   }
 
   // Blank lines separate paragraphs (lines inside one are joined back up). Text without any
@@ -1797,10 +1851,15 @@
   }
 
   const TEXT_PAGE_CSS = `
-    .lector-text { max-width: 40em; margin: 0 auto; padding: 64px 24px 48px; font: 20px/1.6 Georgia, serif; color: #222; }
+    .lector-pastebar { position: sticky; top: 0; z-index: 1; padding: 12px 24px; background: #faf8f4;
+      border-bottom: 1px solid #e4dfd5; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+    .lector-paste { display: block; box-sizing: border-box; width: 100%; max-width: 40em; height: 7.5em;
+      margin: 0 auto; padding: 10px 12px; resize: vertical; font: 15px/1.5 system-ui, sans-serif;
+      color: #222; background: #fff; border: 1px solid #ccc; border-radius: 8px; }
+    .lector-text { max-width: 40em; margin: 0 auto; padding: 24px 24px 48px; font: 20px/1.6 Georgia, serif; color: #222; }
     .lector-text p { margin: 0 0 1em; }
-    .lector-hint { margin-top: 20vh; padding: 48px 24px; text-align: center; color: #888;
-      font: 18px/1.5 system-ui, sans-serif; border: 2px dashed #ccc; border-radius: 12px; }`;
+    .lector-text:empty::before { content: 'The text shows up here, ready to click.'; color: #999;
+      font: 16px/1.5 system-ui, sans-serif; }`;
 
   // ---------- events ----------
   function isEditable(t) {
@@ -1925,6 +1984,7 @@
   }, true);
 
   setEnabled(enabled);
+  if (isReaderTab || isTextTab) restoreSeen();
   if (isReaderTab) openBookReader();
   if (isTextTab) openTextReader();
 })();
