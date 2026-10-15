@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.6.0
+// @version      1.7.0
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode.
 // @author       inferior321
 // @license      MIT
@@ -589,7 +589,7 @@
       .readerbar { position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 1;
         background: #1f2430; color: #f2f2f2; font: 13px system-ui, sans-serif; padding: 5px 10px;
         border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
-      .readerstatus { display: flex; align-items: center; gap: 6px; }
+      .readerstatus { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
       .readerbar button { all: unset; cursor: pointer; padding: 1px 9px; border-radius: 5px; background: #343b4b; }
       .readerbar button:hover { background: #46506a; }
       .readerbar input, .readerbar select { width: 3.2em; background: #2a3040; color: #f2f2f2; border: 1px solid #46506a;
@@ -1179,6 +1179,37 @@
     return select;
   }
 
+  // Dark mode for the book reader, one setting for all books; until you choose, it follows the
+  // system's light/dark setting. PDF pages are drawings, so they're shown with their colours
+  // inverted (photos and coloured figures look like negatives); EPUB text is light on dark.
+  const READER_DARK_KEY = 'readerDark';
+  const READER_BACKGROUNDS = { pdf: ['#525659', '#1f2023'], epub: ['#faf8f4', '#1c1b19'] }; // [light, dark]
+
+  function readerDark() {
+    return GM_getValue(READER_DARK_KEY, window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false);
+  }
+
+  function applyReaderTheme(kind) {
+    const dark = readerDark();
+    document.documentElement.classList.toggle('lector-dark', dark);
+    document.body.style.background = READER_BACKGROUNDS[kind][dark ? 1 : 0];
+  }
+
+  function themeButton(kind) {
+    const button = el('button');
+    const show = () => {
+      button.textContent = readerDark() ? '☀' : '☾';
+      button.title = readerDark() ? 'Light mode' : 'Dark mode';
+    };
+    button.onclick = () => {
+      GM_setValue(READER_DARK_KEY, !readerDark());
+      applyReaderTheme(kind);
+      show();
+    };
+    show();
+    return button;
+  }
+
   // Ctrl +/− zooms the book, not the browser.
   function zoomKeys(zoomOut, zoomIn) {
     document.addEventListener('keydown', (e) => {
@@ -1205,7 +1236,8 @@
     rememberBook(pdfReader.placeKey, book.name, book.blob);
     const place = savedPlace(pdfReader.placeKey) || {}; // { page, scale, label }
     const outline = await pdfOutline(pdfReader.doc);
-    takeOverPage(book.name, PDF_PAGE_CSS, '#525659');
+    takeOverPage(book.name, PDF_PAGE_CSS, READER_BACKGROUNDS.pdf[0]);
+    applyReaderTheme('pdf');
     const container = el('div', 'lector-pdf');
     document.body.prepend(container);
 
@@ -1469,6 +1501,7 @@
       showChapter(lastPage);
       bar.status.append(el('span', 'pdfsep'), toc);
     }
+    bar.status.append(el('span', 'pdfsep'), themeButton('pdf'));
   }
 
   const PDF_PAGE_CSS = `
@@ -1479,7 +1512,10 @@
       text-align: initial; -webkit-text-size-adjust: none; text-size-adjust: none; forced-color-adjust: none;
       transform-origin: 0 0; z-index: 2; }
     .textLayer span { position: absolute; white-space: pre; transform-origin: 0% 0%; cursor: text; color: transparent; }
-    .textLayer ::selection { background: rgba(149, 102, 230, .35); }`;
+    .textLayer ::selection { background: rgba(149, 102, 230, .35); }
+    .lector-dark { color-scheme: dark; }
+    .lector-dark .lector-page { background: #1a1a1a; box-shadow: 0 2px 8px rgba(0,0,0,.7); }
+    .lector-dark .lector-page canvas { filter: invert(.9) hue-rotate(180deg); }`;
 
   // ---------- EPUB ----------
   // An EPUB is a zip of web pages (one or more per chapter) plus an index saying in which order
@@ -1543,7 +1579,8 @@
     const placeKey = `epub:${id}`;
     rememberBook(placeKey, title, book.blob);
     const place = savedPlace(placeKey) || {}; // { chapter, at, scale, label }
-    takeOverPage(title, EPUB_PAGE_CSS, '#faf8f4');
+    takeOverPage(title, EPUB_PAGE_CSS, READER_BACKGROUNDS.epub[0]);
+    applyReaderTheme('epub');
     container.append(...chapters);
     document.body.prepend(container);
     epubReader = { container, chapters, scale: place.scale || 1, placeKey };
@@ -1760,7 +1797,7 @@
     picker.selectedIndex = currentEntry();
     save(); // so the recent-books list shows it even before you scroll
     zoomLabel.textContent = `${Math.round(epubReader.scale * 100)}%`;
-    bar.status.replaceChildren(zoomOut, zoomLabel, zoomIn, el('span', 'pdfsep'), picker);
+    bar.status.replaceChildren(zoomOut, zoomLabel, zoomIn, el('span', 'pdfsep'), picker, el('span', 'pdfsep'), themeButton('epub'));
   }
 
   const EPUB_PAGE_CSS = `
@@ -1771,7 +1808,11 @@
     .lector-book img { max-width: 100%; height: auto; }
     .lector-book pre { white-space: pre-wrap; }
     .lector-book table { border-collapse: collapse; }
-    .lector-book td, .lector-book th { border: 1px solid #ccc; padding: 4px 8px; }`;
+    .lector-book td, .lector-book th { border: 1px solid #ccc; padding: 4px 8px; }
+    .lector-dark { color-scheme: dark; }
+    .lector-dark .lector-book { color: #d9d4ca; }
+    .lector-dark .lector-chapter + .lector-chapter { border-top-color: #3a3832; }
+    .lector-dark .lector-book td, .lector-dark .lector-book th { border-color: #4a4740; }`;
 
   // ---------- text reader ----------
   // "Read pasted text…" opens a tab on example.com (like the book reader): a box at the top to
