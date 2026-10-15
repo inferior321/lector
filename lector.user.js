@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.7.0
+// @version      1.7.1
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode.
 // @author       inferior321
 // @license      MIT
@@ -236,7 +236,8 @@
     const bracketed = (a, b) => google(markedText(ctx, a, b))
       .then((r) => r.text.match(/\[([^[\]]+)\]/)?.[1].trim() || null)
       .catch(() => null);
-    const atStart = /^[\s¿¡"'«“(]*$/.test(ctx.full.slice(ctx.s, ctx.start));
+    // at the start of the sentence, or of a question/exclamation inside it (Dice "¿De verdad?")
+    const atStart = /^[\s¿¡"'«“(]*$|[¿¡][\s"'«“(]*$/.test(ctx.full.slice(ctx.s, ctx.start));
     const answer = (kind, text, extra) => ({ kind, text: tidy(text, phrase, atStart), base: dict?.base || '', sentence: plain, ...extra });
 
     // 1.
@@ -313,12 +314,22 @@
 
   // Strip stray punctuation and the capital letter Google adds at the start of a sentence
   // ("You have to" → "you have to"), but keep "I"/"I'm" and capitals the original had (names).
+  // A selection that ends with its own ? ! . or … keeps that mark, and the sentence's capital
+  // if it starts the sentence too ("¿De verdad?" → "Really?"); Spanish gets its ¿ / ¡ back.
   function tidy(text, phrase, atSentenceStart) {
     let t = text.trim().replace(/^[\s.,;:!?¿¡"'“”«»()]+|[\s.,;:!?¿¡"'“”«»()]+$/g, '');
+    if (!t) return text.trim();
+    const ending = phrase.match(/[.?!…]+(?=[\s"'”»)]*$)/)?.[0];
     const nameLike = /^\p{Lu}/u.test(phrase) && !atSentenceStart;
-    const keepsCapital = cfg.target === 'en' && /^I(\b|')/.test(t);
-    if (!nameLike && !keepsCapital) t = t.charAt(0).toLowerCase() + t.slice(1);
-    return t || text.trim();
+    const startsSentence = atSentenceStart || /^[\s"'“«(]*[¿¡]/.test(phrase); // a quoted "¿…?" counts
+    const keepsCapital = (cfg.target === 'en' && /^I(\b|')/.test(t)) || (ending && startsSentence);
+    if (keepsCapital) t = t.charAt(0).toUpperCase() + t.slice(1);
+    else if (!nameLike) t = t.charAt(0).toLowerCase() + t.slice(1);
+    if (!ending) return t;
+    // Spanish opens a whole question/exclamation with ¿ / ¡ (Google's were stripped above)
+    const wholeClause = startsSentence || /^[\s"'“«(]*\p{Lu}/u.test(phrase);
+    const opening = cfg.target === 'es' && wholeClause ? (ending.includes('?') ? '¿' : '') + (ending.includes('!') ? '¡' : '') : '';
+    return opening + t + ending;
   }
 
   // Does `needle` appear (roughly, ignoring word endings) in `haystack`?
