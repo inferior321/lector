@@ -21,7 +21,7 @@ Tampermonkey checks this address for new versions and updates the script by itse
 | **Drag across words** | Translate a phrase (the selection snaps to whole words) |
 | **Esc** | Close the popup |
 | | Words and phrases you've looked up get a dotted purple underline everywhere they appear on the page, until you reload (shown only in reading mode) |
-| Tampermonkey menu → **Open a PDF or EPUB to read…** | Opens a reader tab: pick a PDF or EPUB book and read it with the same click-to-translate. Each book reopens where you left off. EPUBs get a chapter list and a text-size control |
+| Tampermonkey menu → **Open a PDF or EPUB to read…** | Opens a reader tab: pick a PDF or EPUB book and read it with the same click-to-translate. Your last 5 books are listed under **Continue reading** and reopen with one click, at the same spot and zoom. A chapter list follows the book's own table of contents (or the PDF's outline) |
 | Tampermonkey menu → **Read pasted text…** | Opens a reader tab: press Ctrl+V and the text (an email, a message, a site where clicking doesn't work) is ready to click right away. A new paste replaces it; reloading the tab keeps it |
 | Tampermonkey menu → **Swap direction** | Spanish → English (default) or English → Spanish |
 
@@ -57,6 +57,7 @@ Google translates whole sentences, so Lector works out which part of the transla
 - **Privacy:** each lookup sends the sentence around the word to Google Translate. Keep reading mode off on private pages (email, banking).
 - Lector uses Google Translate's free, unofficial web addresses. Google may limit heavy use for a few minutes. Lector then switches to a second address, and the corner badge turns amber with a countdown if both are busy.
 - Translations are cached in Tampermonkey's storage, so repeat lookups are instant.
+- Your last 5 books are kept as files in the reader page's own browser storage (on this computer only), so they reopen without the file picker. Remove one with its ✕.
 - The book and text readers run on `example.com`, a plain page that doesn't block them. The PDF reader uses [PDF.js](https://mozilla.github.io/pdf.js/) (downloaded once from cdnjs and cached).
 - Doesn't work inside embedded frames, on text drawn as images (e.g. Google Docs), in scanned PDFs, or in copy-protected (DRM) ebooks such as Kindle books.
 
