@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.3.0
+// @version      1.3.1
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, a PDF reader and a pasted-text reader. Alt+T toggles reading mode.
 // @author       inferior321
 // @license      MIT
@@ -967,7 +967,9 @@
   const READER_URL = 'https://example.com/#lector-pdf';
   const isReaderTab = location.hostname === 'example.com' && location.hash === '#lector-pdf';
   const PDF_ZOOM_STEP = 1.15;
-  // Last page read in each PDF (by file name + size), newest last; the oldest are dropped.
+  // Last page read in each PDF, newest last; the oldest are dropped. PDFs are told apart by
+  // PDF.js's fingerprint (the document ID built into the file), so renaming or re-saving a
+  // PDF keeps its place.
   const PDF_PAGES_KEY = 'pdfPages';
   const MAX_PDF_PAGES = 50;
 
@@ -1025,7 +1027,7 @@
       return;
     }
 
-    pdfReader.fileKey = `${file.name}|${file.size}`;
+    pdfReader.fileKey = pdfReader.doc.fingerprints[0];
     takeOverPage(file.name, PDF_PAGE_CSS, '#525659');
     const container = el('div', 'lector-pdf');
     document.body.prepend(container);
