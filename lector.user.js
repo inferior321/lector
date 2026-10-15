@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.0.0
+// @version      1.1.0
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and a PDF reader. Alt+T toggles reading mode.
 // @author       inferior321
 // @license      MIT
@@ -522,7 +522,8 @@
   const pageStyle = document.createElement('style');
   pageStyle.textContent =
     '::highlight(lector-hover) { background-color: rgba(149, 102, 230, .25); }' +
-    '::highlight(lector-word) { background-color: rgba(149, 102, 230, .5); }';
+    '::highlight(lector-word) { background-color: rgba(149, 102, 230, .5); }' +
+    '::highlight(lector-seen) { text-decoration: underline dotted rgb(149, 102, 230); text-decoration-thickness: 2px; }';
   document.head.appendChild(pageStyle);
 
   // Popup lives in a shadow root so the page's CSS can't mess with it.
@@ -634,11 +635,66 @@
     CSS.highlights.set('lector-word', h);
   }
 
+  // Dotted underline on every word/phrase looked up since the page loaded, wherever it appears
+  // on the page (capitals ignored, accents not). Kept in memory only and shown only in reading
+  // mode; text added later (infinite scroll, PDF pages) gets marked too.
+  const seen = new Set();
+  const SEEN_RESCAN_MS = 500;
+  const NO_TEXT_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'TEMPLATE']);
+  let seenTimer = 0;
+  const seenObserver = new MutationObserver(() => {
+    if (enabled) seenTimer ||= setTimeout(markSeen, SEEN_RESCAN_MS);
+  });
+
+  function rememberSeen(phrase) {
+    const key = phrase.replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    if (seen.size === 1) seenObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+    markSeen();
+  }
+
+  function markSeen() {
+    clearTimeout(seenTimer);
+    seenTimer = 0;
+    if (!enabled || !seen.size || !window.CSS?.highlights) return;
+    // all page text as one string, '\u0001' between text nodes, so phrases can cross tags
+    const nodes = [];
+    const starts = [];
+    let text = '';
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (NO_TEXT_TAGS.has(n.parentElement?.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+    });
+    for (let n; (n = walker.nextNode());) {
+      nodes.push(n);
+      starts.push(text.length);
+      text += `${n.data}\u0001`;
+    }
+    // longest first, so a phrase wins over a word inside it
+    const patterns = [...seen].sort((a, b) => b.length - a.length)
+      .map((p) => p.split(' ').map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[\\s\\u0001]+'));
+    const re = new RegExp(`(?<![\\p{L}\\p{M}\\p{N}]['’-]?)(?:${patterns.join('|')})(?!['’-]?[\\p{L}\\p{M}\\p{N}])`, 'giu');
+    const highlight = new Highlight();
+    let i = 0;
+    for (const m of text.matchAll(re)) {
+      const end = m.index + m[0].length;
+      while (starts[i + 1] <= m.index) i++;
+      let j = i;
+      while (starts[j + 1] < end) j++;
+      const range = document.createRange();
+      range.setStart(nodes[i], m.index - starts[i]);
+      range.setEnd(nodes[j], end - starts[j]);
+      highlight.add(range);
+    }
+    CSS.highlights.set('lector-seen', highlight);
+  }
+
   async function lookup(range, phrase) {
     const id = ++lookupId;
     const rect = range.getBoundingClientRect();
     const ctx = sentenceAround(range);
     markWord(range);
+    rememberSeen(phrase);
 
     renderTip(phrase, 'loading', '…');
     tipEl.hidden = false;
@@ -883,7 +939,8 @@
 
   function setEnabled(on) {
     enabled = on;
-    if (!on) { hideTip(); clearHover(); }
+    if (on) markSeen();
+    else { hideTip(); clearHover(); CSS.highlights?.delete('lector-seen'); }
     badgeEl.hidden = !on;
     updateBadge();
   }

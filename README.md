@@ -20,6 +20,7 @@ Tampermonkey checks this address for new versions and updates the script by itse
 | **Click a word** | Translate it in context |
 | **Drag across words** | Translate a phrase (the selection snaps to whole words) |
 | **Esc** | Close the popup |
+| | Words and phrases you've looked up get a dotted purple underline everywhere they appear on the page, until you reload (shown only in reading mode) |
 | Tampermonkey menu → **Open a PDF to read…** | Opens a reader tab: pick a PDF and read it with the same click-to-translate |
 | Tampermonkey menu → **Swap direction** | Spanish → English (default) or English → Spanish |
 
