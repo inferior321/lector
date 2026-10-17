@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.7.1
-// @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode.
+// @version      1.8.0
+// @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode; Alt+Shift+T opens a quick translator.
 // @author       inferior321
 // @license      MIT
 // @homepageURL  https://github.com/inferior321/lector
@@ -22,23 +22,11 @@
   'use strict';
   if (window.top !== window.self) return; // skip iframes
 
-  // ---------- settings ----------
-  // Spanish → English by default; the menu swaps to English → Spanish.
-  const cfg = {
-    get reversed() { return GM_getValue('reversed', false); },
-    get source() { return this.reversed ? 'en' : 'es'; },
-    get target() { return this.reversed ? 'es' : 'en'; },
-  };
-
   // ---------- menu (registered first so it shows up even if a page breaks the UI code) ----------
   GM_registerMenuCommand('Toggle reading mode (Alt+T)', () => setEnabled(!enabled));
+  GM_registerMenuCommand('Lector panel (Alt+Shift+T)', () => toggleQuickBox());
   GM_registerMenuCommand('Open a PDF or EPUB to read…', () => (isReaderTab ? openBookReader() : openReaderTab(READER_URL)));
   GM_registerMenuCommand('Read pasted text…', () => (isTextTab ? openTextReader() : openReaderTab(TEXT_READER_URL)));
-  GM_registerMenuCommand('Swap direction (Spanish ⇄ English)', () => {
-    GM_setValue('reversed', !cfg.reversed);
-    hideTip();
-    setEnabled(enabled); // refresh badge text
-  });
 
   // The tab's own storage: kept across reloads, forgotten when the tab closes. Used by the
   // reader tabs (reload = back where you were); may be blocked, in which case nothing is kept.
@@ -47,6 +35,15 @@
     set(key, value) { try { sessionStorage.setItem(key, value); } catch { /* blocked */ } },
     remove(key) { try { sessionStorage.removeItem(key); } catch { /* blocked */ } },
   };
+
+  // ---------- direction ----------
+  // Each tab has its own direction (the ⇄ on the top pill), kept across reloads; a new tab
+  // starts Spanish → English. Every lookup takes a { source, target } pair along with it, so
+  // a page lookup and a quick-translator lookup running at the same time can't mix them up.
+  const DIRECTION_TAB_KEY = 'lector-reversed';
+  const langPair = (reversed) => (reversed ? { source: 'en', target: 'es' } : { source: 'es', target: 'en' });
+  let tabReversed = tabStore.get(DIRECTION_TAB_KEY) === '1';
+  const pageLang = () => langPair(tabReversed);
 
   const GOOGLE_BACKOFF_MS = 120_000;
   const MAX_SENTENCE_CHARS = 600;
@@ -75,7 +72,7 @@
   const CACHE_KEY = 'translationCache-v1';
   const CACHE_MAX_ENTRIES = 5000;
   let googleCache = null;
-  let googlePausedUntil = 0; // set only while every Google address is refusing (badge / popup countdown)
+  let googlePausedUntil = 0; // set only while every Google address is refusing (pill / popup countdown)
   let cacheSaveTimer = 0;
 
   const loadCache = () => (googleCache ??= new Map(GM_getValue(CACHE_KEY, [])));
@@ -128,11 +125,11 @@
       return result;
     }
     googlePausedUntil = Math.min(...GOOGLE_HOSTS.map((h) => h.pausedUntil)); // first one back
-    updateBadge();
+    updatePill();
     throw busyError();
   }
 
-  // Google is refusing requests: the error says until when, so the popup and badge can count down.
+  // Google is refusing requests: the error says until when, so the popup and the pill can count down.
   function busyError() {
     const e = new Error('Google is busy (too many requests)');
     e.busyUntil = googlePausedUntil;
@@ -145,11 +142,11 @@
   };
 
   // withDict also asks for dictionary meanings (only useful for a single word or short phrase).
-  function google(text, withDict = false) {
+  function google(text, lang, withDict = false) {
     const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t'
       + (withDict ? '&dt=bd' : '')
-      + `&sl=${cfg.source}&tl=${cfg.target}&q=${encodeURIComponent(text)}`;
-    return fetchGoogle(url, `${cfg.source}|${cfg.target}|${withDict}|${text}`, (data) => ({
+      + `&sl=${lang.source}&tl=${lang.target}&q=${encodeURIComponent(text)}`;
+    return fetchGoogle(url, `${lang.source}|${lang.target}|${withDict}|${text}`, (data) => ({
       text: (data[0] || []).map((seg) => seg[0] || '').join(''),
       ...parseDictionary(withDict ? data[1] || [] : [], text),
     }));
@@ -158,10 +155,10 @@
   // HTML mode (what Chrome's page translator uses): Google moves <b> tags onto the words
   // they correspond to, so "<b>La</b> vi en la tienda" → "I saw <b>her</b> in the store".
   // Returns the words inside the tag and the plain translated sentence.
-  function googleTagged(html) {
+  function googleTagged(html, lang) {
     const url = 'https://translate.googleapis.com/translate_a/t?client=gtx&format=html'
-      + `&sl=${cfg.source}&tl=${cfg.target}&q=${encodeURIComponent(html)}`;
-    return fetchGoogle(url, `${cfg.source}|${cfg.target}|html|${html}`, (data) => {
+      + `&sl=${lang.source}&tl=${lang.target}&q=${encodeURIComponent(html)}`;
+    return fetchGoogle(url, `${lang.source}|${lang.target}|html|${html}`, (data) => {
       const out = [data].flat(2).find((x) => typeof x === 'string') || '';
       const text = (t) => decodeEntities(t.replace(/<[^>]*>/g, '')).replace(/\s+([.,;:!?])/g, '$1').trim();
       return { inTag: text(out.match(/<b>([\s\S]*?)<\/b>/)?.[1] || ''), plain: text(out) };
@@ -228,40 +225,41 @@
   // ("un [ojo] de la cara" → "an [eye] of the face").
   const GROW_STEPS = [[1, 0], [0, 1], [1, 1], [2, 0], [0, 2], [2, 1], [1, 2], [2, 2]]; // [left, right] words
 
-  async function translateInContext(phrase, ctx) {
+  async function translateInContext(phrase, ctx, lang) {
+    const to = lang.target;
     if (!ctx) {
-      const r = await google(phrase, true);
-      return { kind: 'fallback', text: tidy(r.text, phrase, true), meanings: r.meanings, sentence: '', base: r.base };
+      const r = await google(phrase, lang, true);
+      return { kind: 'fallback', text: tidy(r.text, phrase, true, to), meanings: r.meanings, sentence: '', base: r.base };
     }
-    const bracketed = (a, b) => google(markedText(ctx, a, b))
+    const bracketed = (a, b) => google(markedText(ctx, a, b), lang)
       .then((r) => r.text.match(/\[([^[\]]+)\]/)?.[1].trim() || null)
       .catch(() => null);
     // at the start of the sentence, or of a question/exclamation inside it (Dice "¿De verdad?")
     const atStart = /^[\s¿¡"'«“(]*$|[¿¡][\s"'«“(]*$/.test(ctx.full.slice(ctx.s, ctx.start));
-    const answer = (kind, text, extra) => ({ kind, text: tidy(text, phrase, atStart), base: dict?.base || '', sentence: plain, ...extra });
+    const answer = (kind, text, extra) => ({ kind, text: tidy(text, phrase, atStart, to), base: dict?.base || '', sentence: plain, ...extra });
 
     // 1.
     const [tagged, dict] = await Promise.all([
-      googleTagged(taggedText(ctx)).catch(() => null),
-      google(phrase, true).catch(() => null),
+      googleTagged(taggedText(ctx), lang).catch(() => null),
+      google(phrase, lang, true).catch(() => null),
     ]);
     const meanings = dict?.allMeanings || [];
     const inTag = tagged?.inTag || '';
-    const plain = tagged?.plain || (await google(sentenceText(ctx))).text;
-    if (inTag && relatesTo(inTag, meanings)) return answer('context', inTag);
+    const plain = tagged?.plain || (await google(sentenceText(ctx), lang)).text;
+    if (inTag && relatesTo(inTag, meanings, to)) return answer('context', inTag);
 
     // 2.
     const inBrackets = await bracketed(ctx.start, ctx.end);
-    const bracketsOk = !!inBrackets && appearsIn(plain, inBrackets);
+    const bracketsOk = !!inBrackets && appearsIn(plain, inBrackets, to);
     if (bracketsOk && inTag) {
-      const best = appearsIn(inBrackets, inTag) ? inBrackets
-        : appearsIn(inTag, inBrackets) ? inTag
-          : relatesTo(inBrackets, meanings) ? inBrackets : inTag;
+      const best = appearsIn(inBrackets, inTag, to) ? inBrackets
+        : appearsIn(inTag, inBrackets, to) ? inTag
+          : relatesTo(inBrackets, meanings, to) ? inBrackets : inTag;
       return answer('context', best);
     }
 
     // 3.
-    const hit = meanings.find((w) => appearsIn(plain, w));
+    const hit = meanings.find((w) => appearsIn(plain, w, to));
     if (hit) return answer('context', hit);
     if (bracketsOk) return answer('context', inBrackets);
 
@@ -274,15 +272,15 @@
     for (const batch of [spans.slice(0, 3), spans.slice(3)]) {
       const found = await Promise.all(batch.map((sp) => bracketed(sp.a, sp.b)));
       for (const [i, t] of found.entries()) {
-        if (!t || !appearsIn(plain, t)) continue;
-        if (!endsDangling(t)) return answer('phrase', t, { span: batch[i] });
+        if (!t || !appearsIn(plain, t, to)) continue;
+        if (!endsDangling(t, to)) return answer('phrase', t, { span: batch[i] });
         cutOff ??= { t, span: batch[i] };
       }
     }
     if (cutOff) return answer('phrase', cutOff.t, { span: cutOff.span });
 
     // 5.
-    return { kind: 'fallback', text: tidy(inTag || dict?.text || '?', phrase, atStart), meanings: dict?.meanings || [], sentence: plain, base: dict?.base || '' };
+    return { kind: 'fallback', text: tidy(inTag || dict?.text || '?', phrase, atStart, to), meanings: dict?.meanings || [], sentence: plain, base: dict?.base || '' };
   }
 
   // Is `answer` one of the dictionary meanings (sharing a real word, not just "the"/"is")?
@@ -292,11 +290,12 @@
     es: 'el la los las un una de a al del que y o se lo le me te es son ser estar no',
   };
   const fillerCache = {};
-  function relatesTo(answer, meanings) {
+  // (`to`: the language the answer is in, here and in the helpers below)
+  function relatesTo(answer, meanings, to) {
     if (!meanings.length) return true;
-    const filler = (fillerCache[cfg.target] ??= new Set(normWords(FILLER_WORDS[cfg.target])));
-    const known = new Set(meanings.flatMap(normWords));
-    return normWords(answer).some((w) => !filler.has(w) && known.has(w));
+    const filler = (fillerCache[to] ??= new Set(normWords(FILLER_WORDS[to], to)));
+    const known = new Set(meanings.flatMap((m) => normWords(m, to)));
+    return normWords(answer, to).some((w) => !filler.has(w) && known.has(w));
   }
 
   // Small words a phrase translation shouldn't stop on.
@@ -307,41 +306,41 @@
       'por', 'para', 'muy', 'mi', 'tu', 'su', 'mis', 'tus', 'sus', 'y', 'o', 'que', 'es', 'son']),
   };
 
-  function endsDangling(text) {
+  function endsDangling(text, to) {
     const last = text.toLowerCase().match(/[\p{L}']+(?=[^\p{L}']*$)/u)?.[0];
-    return !!last && DANGLING[cfg.target].has(last);
+    return !!last && DANGLING[to].has(last);
   }
 
   // Strip stray punctuation and the capital letter Google adds at the start of a sentence
   // ("You have to" → "you have to"), but keep "I"/"I'm" and capitals the original had (names).
   // A selection that ends with its own ? ! . or … keeps that mark, and the sentence's capital
   // if it starts the sentence too ("¿De verdad?" → "Really?"); Spanish gets its ¿ / ¡ back.
-  function tidy(text, phrase, atSentenceStart) {
+  function tidy(text, phrase, atSentenceStart, to) {
     let t = text.trim().replace(/^[\s.,;:!?¿¡"'“”«»()]+|[\s.,;:!?¿¡"'“”«»()]+$/g, '');
     if (!t) return text.trim();
     const ending = phrase.match(/[.?!…]+(?=[\s"'”»)]*$)/)?.[0];
     const nameLike = /^\p{Lu}/u.test(phrase) && !atSentenceStart;
     const startsSentence = atSentenceStart || /^[\s"'“«(]*[¿¡]/.test(phrase); // a quoted "¿…?" counts
-    const keepsCapital = (cfg.target === 'en' && /^I(\b|')/.test(t)) || (ending && startsSentence);
+    const keepsCapital = (to === 'en' && /^I(\b|')/.test(t)) || (ending && startsSentence);
     if (keepsCapital) t = t.charAt(0).toUpperCase() + t.slice(1);
     else if (!nameLike) t = t.charAt(0).toLowerCase() + t.slice(1);
     if (!ending) return t;
     // Spanish opens a whole question/exclamation with ¿ / ¡ (Google's were stripped above)
     const wholeClause = startsSentence || /^[\s"'“«(]*\p{Lu}/u.test(phrase);
-    const opening = cfg.target === 'es' && wholeClause ? (ending.includes('?') ? '¿' : '') + (ending.includes('!') ? '¡' : '') : '';
+    const opening = to === 'es' && wholeClause ? (ending.includes('?') ? '¿' : '') + (ending.includes('!') ? '¡' : '') : '';
     return opening + t + ending;
   }
 
   // Does `needle` appear (roughly, ignoring word endings) in `haystack`?
-  function appearsIn(haystack, needle) {
-    const have = new Set(normWords(haystack));
-    const want = normWords(needle);
+  function appearsIn(haystack, needle, to) {
+    const have = new Set(normWords(haystack, to));
+    const want = normWords(needle, to);
     return want.length > 0 && want.every((w) => have.has(w));
   }
 
-  function normWords(text) {
+  function normWords(text, to) {
     let t = text.toLowerCase().replace(/’/g, "'");
-    if (cfg.target === 'en') {
+    if (to === 'en') {
       t = t.replace(/\bcan't\b/g, 'can not').replace(/\bwon't\b/g, 'will not').replace(/n't\b/g, ' not')
         .replace(/'re\b/g, ' are').replace(/'m\b/g, ' am').replace(/'ll\b/g, ' will')
         .replace(/'ve\b/g, ' have').replace(/'d\b/g, ' would').replace(/'s\b/g, ' is');
@@ -360,6 +359,13 @@
   const wordChar = /[\p{L}\p{M}\p{N}'’-]/u;
 
   function caretAt(x, y) {
+    if (quickOutAt(x, y)) { // the quick translator's output lives in our shadow root, out of the page's reach
+      const p = document.caretPositionFromPoint?.(x, y, { shadowRoots: [shadow] });
+      if (!p || !quick.out.contains(p.offsetNode)) return null;
+      const r = document.createRange();
+      r.setStart(p.offsetNode, p.offset);
+      return r;
+    }
     if (document.caretRangeFromPoint) return document.caretRangeFromPoint(x, y);
     const p = document.caretPositionFromPoint?.(x, y);
     if (!p) return null;
@@ -475,7 +481,7 @@
 
   // Where the word/phrase sits: its block element, the block's text, the sentence span
   // [s, e) and the word span [start, end), all as offsets into that text. null if unusable.
-  function sentenceAround(range) {
+  function sentenceAround(range, source) {
     const block = blockAncestor(range.commonAncestorContainer);
     if (!block.contains(range.startContainer) || !block.contains(range.endContainer)) return null;
 
@@ -487,7 +493,7 @@
     const end = start + range.toString().length;
     if (!full.slice(start, end).trim()) return null;
 
-    const hits = splitSentences(full, cfg.source, block.classList.contains('textLayer')).filter((p) => p.end > start && p.start < end);
+    const hits = splitSentences(full, source, block.classList.contains('textLayer')).filter((p) => p.end > start && p.start < end);
     let s = hits.length ? hits[0].start : 0;
     let e = hits.length ? hits.at(-1).end : full.length;
     if (e - s > MAX_SENTENCE_CHARS) { // very long "sentence" (lists, no punctuation): keep a window
@@ -616,20 +622,59 @@
       .readerbar .recentremove { background: transparent; color: #9aa3b5; }
       .pdfzoom { min-width: 3.2em; text-align: center; }
       .pdfsep { width: 10px; }
-      .badge { position: fixed; bottom: 12px; right: 12px; background: #6a3fb5; color: #fff;
-        font: 12px system-ui, sans-serif; padding: 4px 8px; border-radius: 6px;
-        cursor: pointer; opacity: .85; }
-      .badge.busy { background: #b7791f; }`;
+      [hidden] { display: none !important; } /* the display rules below would otherwise beat it */
+      .tip { z-index: 3; }
+      .dirpill { position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 1;
+        display: flex; align-items: center; gap: 4px; padding: 3px 4px 3px 10px; border-radius: 8px;
+        background: #6a3fb5; color: #fff; font: 12px system-ui, sans-serif; white-space: nowrap;
+        box-shadow: 0 4px 14px rgba(0,0,0,.3); }
+      .dirpill.busy { background: #b7791f; }
+      .dirpill button { all: unset; cursor: pointer; padding: 1px 7px; border-radius: 5px; }
+      .dirpill button:hover { background: rgba(255,255,255,.2); }
+      .dirlabel { font-weight: 600; letter-spacing: .02em; }
+      .readerbar .dirpill { position: static; transform: none; display: inline-flex; margin-left: 10px;
+        padding: 0 0 0 8px; box-shadow: none; }
+      .readerbar .dirpill button { padding: 0 6px; background: transparent; }
+      .readerbar .dirpill button:hover { background: rgba(255,255,255,.2); }
+      .qbox { position: fixed; z-index: 2; top: 48px; left: 50%; transform: translateX(-50%);
+        width: min(440px, calc(100vw - 32px)); box-sizing: border-box; overflow: hidden;
+        background: #1f2430; color: #f2f2f2; font: 14px/1.4 system-ui, sans-serif;
+        border-radius: 10px; box-shadow: 0 8px 28px rgba(0,0,0,.45); }
+      .qhead { display: flex; align-items: center; gap: 6px; padding: 6px 6px 6px 12px;
+        background: #2a3040; user-select: none; }
+      .qdir { font-size: 12px; font-weight: 600; color: #c9b8f0; letter-spacing: .02em; }
+      .qhead button { all: unset; cursor: pointer; padding: 1px 7px; border-radius: 5px; color: #d6dbe4; }
+      .qhead button:hover { background: #46506a; }
+      .qspace { flex: 1; }
+      .qin { display: block; box-sizing: border-box; width: calc(100% - 20px); margin: 10px; height: 4.6em;
+        resize: vertical; padding: 6px 8px; font: inherit; color: #f2f2f2; background: #2a3040;
+        border: 1px solid #46506a; border-radius: 6px; outline: none; }
+      .qin:focus { border-color: #9566e6; }
+      .qrow { display: flex; align-items: flex-start; gap: 4px; padding: 0 10px 10px 12px; }
+      .qout { flex: 1; min-height: 1.4em; max-height: 40vh; overflow: auto; white-space: pre-wrap;
+        font-size: 15px; cursor: default; }
+      .qout:empty::before { content: 'Press Enter to translate'; color: #6f7a8c; font-size: 13px; }
+      .qout.err { color: #ff8a80; font-size: 13px; }
+      .qactions { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 12px; border-top: 1px solid #343b4b; }
+      .qactions button, .qbook { all: unset; cursor: pointer; border-radius: 6px; font-size: 13px; }
+      .qactions button { padding: 4px 10px; background: #343b4b; }
+      .qactions button:hover { background: #46506a; }
+      .qbooks:empty { display: none; }
+      .qbooks { padding: 0 6px 8px; }
+      .qbookshead { color: #9aa3b5; font-size: 12px; margin: 0 0 2px 6px; }
+      .qbook { display: flex; justify-content: space-between; gap: 16px; padding: 4px 6px; width: 100%; box-sizing: border-box; }
+      .qbook:hover { background: #343b4b; }
+      .qbooktitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .qbookwhere { color: #9aa3b5; white-space: nowrap; }
+      ::highlight(lector-hover) { background-color: rgba(149, 102, 230, .35); }
+      ::highlight(lector-word) { background-color: rgba(149, 102, 230, .6); }`;
   const tipEl = el('div', 'tip');
   tipEl.hidden = true;
-  const badgeEl = el('div', 'badge');
-  badgeEl.hidden = true;
-  badgeEl.title = 'Click or press Alt+T to turn off';
-  badgeEl.onclick = () => setEnabled(false);
-  shadow.append(shadowStyle, tipEl, badgeEl);
+  shadow.append(shadowStyle, tipEl);
   document.body.appendChild(host);
 
   let lookupId = 0;
+  let tipFromQuickBox = false; // the popup is for a word in the quick translator (closes with it)
 
   function hideTip() {
     lookupId++;
@@ -760,9 +805,13 @@
   async function lookup(range, phrase) {
     const id = ++lookupId;
     const rect = range.getBoundingClientRect();
-    const ctx = sentenceAround(range);
+    // a word in the quick translator's output is looked up back into the box's input language
+    const inQuickBox = quick.out.contains(range.startContainer);
+    tipFromQuickBox = inQuickBox;
+    const lang = inQuickBox ? langPair(!quick.reversed) : pageLang();
+    const ctx = sentenceAround(range, lang.source);
     markWord(range);
-    rememberSeen(phrase);
+    if (!inQuickBox) rememberSeen(phrase); // underlines are for the page's own text
 
     renderTip(phrase, 'loading', '…');
     tipEl.hidden = false;
@@ -770,7 +819,7 @@
 
     let result;
     try {
-      result = await translateInContext(phrase, ctx);
+      result = await translateInContext(phrase, ctx, lang);
     } catch (e) {
       if (id !== lookupId) return;
       showError(e, id, rect, () => lookup(range, phrase), phrase);
@@ -786,14 +835,14 @@
       if (phraseRange) markWord(phraseRange);
     }
     const span = result.span || (ctx && { a: ctx.start, b: ctx.end });
-    const pair = () => sentencePair(ctx, span, result.sentence, result.text);
+    const pair = () => sentencePair(ctx, span, result.sentence, result.text, lang);
     if (result.kind === 'fallback') {
       for (const { pos, words } of result.meanings) details.push(detail(`${pos}: `, words.join(', ')));
       if (ctx && result.sentence) details.push(pair());
     }
     const base = result.base && result.base.toLowerCase() !== phrase.toLowerCase() ? result.base : '';
     renderTip(phrase, result.kind, result.text, details, base);
-    tipEl.querySelector('.orig').append(sayButton(phrase));
+    tipEl.querySelector('.orig').append(sayButton(phrase, lang.source));
     if (result.kind !== 'fallback' && ctx && result.sentence) tipEl.append(sentenceToggle(pair, rect));
     tipEl.append(dictionaryLink(phraseText));
     placeTip(rect);
@@ -866,17 +915,17 @@
   // original and the matching words highlighted in the translation.
   //   ES  Me senté en el [banco] del parque.
   //   EN  I sat on the park [bench].
-  function sentencePair(ctx, span, translated, answer) {
+  function sentencePair(ctx, span, translated, answer, lang) {
     const { full, s, e } = ctx;
     const original = [clean(full.slice(s, span.a)).trimStart(), clean(full.slice(span.a, span.b)).trim(),
       clean(full.slice(span.b, e)).trimEnd()];
-    const at = locate(translated, answer);
+    const at = locate(translated, answer, lang.target);
     const english = at ? [translated.slice(0, at[0]), translated.slice(at[0], at[1]), translated.slice(at[1])] : [translated, '', ''];
     const src = marked('src', original);
-    src.append(sayButton(original.join('')));
+    src.append(sayButton(original.join(''), lang.source));
     const pair = el('div', 'pair');
-    pair.append(el('span', 'lang', cfg.source.toUpperCase()), src,
-      el('span', 'lang', cfg.target.toUpperCase()), marked('dst', english));
+    pair.append(el('span', 'lang', lang.source.toUpperCase()), src,
+      el('span', 'lang', lang.target.toUpperCase()), marked('dst', english));
     return pair;
   }
 
@@ -890,16 +939,16 @@
 
   // Where `needle` sits in `haystack`: exact (ignoring case) if possible, otherwise the
   // shortest run of words that contains all its words ("it is" in "It's very cold").
-  function locate(haystack, needle) {
+  function locate(haystack, needle, to) {
     if (!needle) return null;
     const i = haystack.toLowerCase().indexOf(needle.toLowerCase());
     if (i >= 0) return [i, i + needle.length];
-    const want = normWords(needle);
+    const want = normWords(needle, to);
     const words = [...haystack.matchAll(/[\p{L}\p{N}'’]+/gu)];
     let best = null;
     for (let a = 0; a < words.length; a++) {
       for (let b = a; b < Math.min(words.length, a + want.length + 3); b++) {
-        const got = new Set(normWords(words.slice(a, b + 1).map((m) => m[0]).join(' ')));
+        const got = new Set(normWords(words.slice(a, b + 1).map((m) => m[0]).join(' '), to));
         if (!want.every((w) => got.has(w))) continue;
         const range = [words[a].index, words[b].index + words[b][0].length];
         if (!best || range[1] - range[0] < best[1] - best[0]) best = range;
@@ -921,7 +970,7 @@
 
   // 🔊 states: idle → .loading (pulses while fetching) → .playing (purple glow; click to stop)
   // → back to idle. On failure it becomes 🔇; hover says why, click to try again.
-  function sayButton(text) {
+  function sayButton(text, lang) {
     const btn = el('button', 'say', '🔊');
     btn.title = 'Listen';
     btn.onclick = (e) => {
@@ -930,7 +979,7 @@
       btn.textContent = '🔊';
       btn.classList.remove('failed');
       btn.title = 'Listen';
-      speak(text, btn).catch((err) => {
+      speak(text, lang, btn).catch((err) => {
         btn.textContent = '🔇';
         btn.classList.add('failed');
         btn.title = `No audio: ${err.message} (click to try again)`;
@@ -939,12 +988,12 @@
     return btn;
   }
 
-  async function speak(text, btn) {
+  async function speak(text, lang, btn) {
     nowPlaying?.pause();
     btn.classList.add('loading');
     try {
       for (const chunk of speechChunks(text.trim())) {
-        const audio = new Audio(await ttsClip(chunk));
+        const audio = new Audio(await ttsClip(chunk, lang));
         nowPlaying = audio;
         btn.classList.replace('loading', 'playing');
         await new Promise((resolve, reject) => {
@@ -959,12 +1008,12 @@
     }
   }
 
-  async function ttsClip(text) {
-    const key = `${cfg.source}|${text}`;
+  async function ttsClip(text, lang) {
+    const key = `${lang}|${text}`;
     if (ttsCache.has(key)) return ttsCache.get(key);
     const res = await request({
       method: 'GET',
-      url: `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=gtx&tl=${cfg.source}&q=${encodeURIComponent(text)}`,
+      url: `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=gtx&tl=${lang}&q=${encodeURIComponent(text)}`,
       responseType: 'arraybuffer',
     });
     if (res.status !== 200) throw new Error(`Google voice HTTP ${res.status}`);
@@ -1009,19 +1058,184 @@
     enabled = on;
     if (on) markSeen();
     else { hideTip(); clearHover(); CSS.highlights?.delete('lector-seen'); }
-    badgeEl.hidden = !on;
-    updateBadge();
+    pill.el.hidden = !on;
+    updatePill();
   }
 
-  //   [Lector: es → en]             normal (purple)
-  //   [⚠ Google busy · 1:42]        while Google refuses requests (amber, counts down)
-  let badgeTimer = 0;
-  function updateBadge() {
-    clearTimeout(badgeTimer);
+  // ---------- direction pill ----------
+  // Fixed at the top centre while reading mode is on (in the book reader it sits at the end
+  // of the reader bar instead):
+  //   [ ES → EN   ⇄   ✕ ]              ⇄ swaps this tab's direction, ✕ turns reading mode off
+  //   [ ⚠ Google busy · 1:42   ⇄   ✕ ]  while Google refuses requests (amber, counts down)
+  const pill = (() => {
+    const box = el('div', 'dirpill');
+    box.hidden = true;
+    const label = el('span', 'dirlabel');
+    const swap = el('button', 'dirswap', '⇄');
+    swap.title = 'Swap direction (this tab)';
+    swap.onclick = () => {
+      tabReversed = !tabReversed;
+      tabStore.set(DIRECTION_TAB_KEY, tabReversed ? '1' : '0');
+      hideTip();
+      updatePill();
+    };
+    const off = el('button', 'diroff', '✕');
+    off.title = 'Turn reading mode off (Alt+T)';
+    off.onclick = () => setEnabled(false);
+    box.append(label, swap, off);
+    shadow.append(box);
+    return { el: box, label };
+  })();
+
+  let pillTimer = 0;
+  function updatePill() {
+    clearTimeout(pillTimer);
     const busy = Date.now() < googlePausedUntil;
-    badgeEl.classList.toggle('busy', busy);
-    badgeEl.textContent = busy ? `⚠ Google busy · ${countdown(googlePausedUntil)}` : `Lector: ${cfg.source} → ${cfg.target}`;
-    if (busy) badgeTimer = setTimeout(updateBadge, 1000);
+    const { source, target } = pageLang();
+    pill.el.classList.toggle('busy', busy);
+    pill.label.textContent = busy ? `⚠ Google busy · ${countdown(googlePausedUntil)}` : `${source.toUpperCase()} → ${target.toUpperCase()}`;
+    if (busy) pillTimer = setTimeout(updatePill, 1000);
+  }
+
+  // ---------- Lector panel (Alt+Shift+T) ----------
+  // Centered under the direction pill. A quick translator on top, then shortcuts:
+  //   ┌ EN → ES   ⇄                          ✕ ┐
+  //   │ [ how do I say this?                 ] │   Enter translates, Shift+Enter starts a new line
+  //   │ ¿cómo digo esto?                    🔊 │   click a word for the popup (back into the input language)
+  //   ├──────────────────────────────────────────┤
+  //   │ [📖 Open PDF/EPUB] [📝 Read pasted text] │   new tabs
+  //   │ [Reading mode: off · turn on]           │
+  //   │ Continue reading                         │   the last books, each reopens in a new tab
+  //   │   Cien años de soledad      Capítulo 4   │
+  //   └──────────────────────────────────────────┘
+  // The translator's direction starts opposite to the tab's (reading Spanish → write in
+  // Spanish); its text and direction are kept in the tab's storage (back after closing the
+  // panel or reloading). Esc, ✕, Alt+Shift+T or a click outside close the panel.
+  const QUICK_TAB_KEY = 'lector-quick';
+  const quick = (() => {
+    const box = el('div', 'qbox');
+    box.hidden = true;
+    const head = el('div', 'qhead');
+    const dir = el('span', 'qdir');
+    const swap = el('button', 'qswap', '⇄');
+    swap.title = 'Swap direction, and translate the translation back';
+    const close = el('button', 'qclose', '✕');
+    close.title = 'Close (Esc or Alt+Shift+T)';
+    head.append(dir, swap, el('span', 'qspace'), close);
+    const input = el('textarea', 'qin');
+    input.spellcheck = false;
+    input.placeholder = 'Type or paste, then press Enter';
+    const row = el('div', 'qrow');
+    const out = el('div', 'qout');
+    row.append(out);
+    const actions = el('div', 'qactions');
+    const openBook = el('button', 'qopenbook', '📖 Open PDF/EPUB');
+    const openText = el('button', 'qopentext', '📝 Read pasted text');
+    const reading = el('button', 'qreading');
+    actions.append(openBook, openText, reading);
+    const books = el('div', 'qbooks');
+    box.append(head, input, row, actions, books);
+    shadow.append(box);
+    return { box, dir, swap, close, input, row, out, openBook, openText, reading, books, say: null, reversed: false, opened: false };
+  })();
+
+  function toggleQuickBox() {
+    if (!quick.box.hidden) { closeQuickBox(); return; }
+    if (!quick.opened) restoreQuickBox();
+    showPanelShortcuts();
+    quick.box.hidden = false;
+    quick.input.focus();
+  }
+
+  function closeQuickBox() {
+    if (tipFromQuickBox) hideTip();
+    quick.box.hidden = true;
+    clearHover();
+  }
+
+  // First opening in this tab: last text from the tab's storage, or empty and opposite to the tab.
+  function restoreQuickBox() {
+    quick.opened = true;
+    let saved = null;
+    try { saved = JSON.parse(tabStore.get(QUICK_TAB_KEY)); } catch { /* nothing usable saved */ }
+    quick.reversed = saved ? !!saved.reversed : !tabReversed;
+    quick.input.value = saved?.input || '';
+    showQuickOutput(saved?.output || '');
+  }
+
+  function saveQuickBox() {
+    tabStore.set(QUICK_TAB_KEY, JSON.stringify({ reversed: quick.reversed, input: quick.input.value, output: quick.out.textContent }));
+  }
+
+  function showQuickOutput(text, isError = false) {
+    const { source, target } = langPair(quick.reversed);
+    quick.dir.textContent = `${source.toUpperCase()} → ${target.toUpperCase()}`;
+    quick.out.textContent = text;
+    quick.out.classList.toggle('err', isError);
+    quick.say?.remove();
+    quick.say = null;
+    if (text && !isError) {
+      quick.say = sayButton(text, target);
+      quick.say.classList.add('qsay');
+      quick.row.append(quick.say);
+    }
+  }
+
+  let quickId = 0;
+  async function translateQuickBox() {
+    const text = quick.input.value.trim();
+    const id = ++quickId;
+    hideTip();
+    if (!text) { showQuickOutput(''); saveQuickBox(); return; }
+    showQuickOutput('…');
+    try {
+      const r = await google(text, langPair(quick.reversed));
+      if (id === quickId) showQuickOutput(r.text);
+    } catch (e) {
+      if (id !== quickId) return;
+      showQuickOutput(e.busyUntil ? `Google is busy — try again in ${countdown(e.busyUntil)}` : e.message, true);
+    }
+    saveQuickBox();
+  }
+
+  // Reading mode button and the Continue reading list, as they are right now.
+  function showPanelShortcuts() {
+    quick.reading.textContent = enabled ? 'Reading mode: on · turn off' : 'Reading mode: off · turn on';
+    quick.books.replaceChildren();
+    const recent = GM_getValue(RECENT_LIST_KEY, []);
+    if (!recent.length) return;
+    quick.books.append(el('div', 'qbookshead', 'Continue reading'));
+    for (const { key, title } of recent) {
+      const open = el('button', 'qbook');
+      open.append(el('span', 'qbooktitle', title), el('span', 'qbookwhere', savedPlace(key)?.label || ''));
+      open.onclick = () => { closeQuickBox(); openReaderTab(`${READER_URL}?book=${encodeURIComponent(key)}`); };
+      quick.books.append(open);
+    }
+  }
+
+  quick.input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); translateQuickBox(); }
+  });
+  quick.input.addEventListener('input', saveQuickBox);
+  // Typing in the box is ours: the page doesn't get the keys (no "k" pausing a YouTube video).
+  for (const type of ['keydown', 'keyup', 'keypress']) quick.box.addEventListener(type, (e) => e.stopPropagation());
+  quick.close.onclick = closeQuickBox;
+  quick.swap.onclick = () => {
+    const translation = quick.out.classList.contains('err') ? '' : quick.out.textContent;
+    quick.reversed = !quick.reversed;
+    if (translation && translation !== '…') quick.input.value = translation;
+    translateQuickBox();
+    quick.input.focus();
+  };
+  // In a reader tab that hasn't opened anything yet, these show its file picker / paste box.
+  quick.openBook.onclick = () => { closeQuickBox(); if (isReaderTab && !bookOpen) openBookReader(); else openReaderTab(READER_URL); };
+  quick.openText.onclick = () => { closeQuickBox(); if (isTextTab) openTextReader(); else openReaderTab(TEXT_READER_URL); };
+  quick.reading.onclick = () => { closeQuickBox(); setEnabled(!enabled); };
+  document.addEventListener('mousedown', (e) => { if (!quick.box.hidden && !inOurUi(e)) closeQuickBox(); }, true);
+
+  // Is (x, y) over the quick translator's output text?
+  function quickOutAt(x, y) {
+    return !quick.box.hidden && !!shadow.elementFromPoint(x, y)?.closest('.qout');
   }
 
   // ---------- book reader (PDF / EPUB) ----------
@@ -1030,7 +1244,8 @@
   // no security rules (many big sites, e.g. Google, block the code PDF.js needs). There you
   // pick a file and the tab becomes the reader; the normal hover/click/drag code works on it.
   const READER_URL = 'https://example.com/#lector-book';
-  const isReaderTab = location.hostname === 'example.com' && location.hash === '#lector-book';
+  // '#lector-book?book=<key>' (from the panel's Continue reading list) opens that book.
+  const isReaderTab = location.hostname === 'example.com' && /^#lector-book(\?|$)/.test(location.hash);
   const PDF_ZOOM_STEP = 1.15;
   const PDF_DRAW_MARGIN_PX = 1200; // pages are drawn when this close to the screen
   const PDF_KEEP_PAGES = 5; // drawings kept on each side of the current page (the rest are freed)
@@ -1044,6 +1259,11 @@
   const BOOKS_DB = 'lector-books';
   const MAX_RECENT_BOOKS = 5;
   const TAB_BOOK_KEY = 'lector-book'; // the book open in this tab, so a reload reopens it
+  if (isReaderTab && location.hash !== '#lector-book') { // opened the way a reload reopens a book
+    const key = new URLSearchParams(location.hash.split('?')[1]).get('book');
+    if (key) tabStore.set(TAB_BOOK_KEY, key);
+    history.replaceState(null, '', '#lector-book');
+  }
 
   // A normal browser tab: the file picker doesn't open in tabs made by Tampermonkey's
   // GM_openInTab, so don't switch to that.
@@ -1093,9 +1313,15 @@
     });
   }
 
+  // The book files can only be read on example.com, so the list itself ([{ key, title }],
+  // newest first) is also copied to the userscript storage for the Lector panel on other sites.
+  const RECENT_LIST_KEY = 'recentBookList';
+
   async function recentBooks() { // newest first
     try {
-      return (await booksStore('readonly', (store) => store.getAll())).sort((a, b) => b.opened - a.opened);
+      const books = (await booksStore('readonly', (store) => store.getAll())).sort((a, b) => b.opened - a.opened);
+      GM_setValue(RECENT_LIST_KEY, books.slice(0, MAX_RECENT_BOOKS).map(({ key, title }) => ({ key, title })));
+      return books;
     } catch {
       return []; // storage blocked: just no list
     }
@@ -1113,6 +1339,7 @@
   }
 
   function forgetBook(key) {
+    GM_setValue(RECENT_LIST_KEY, GM_getValue(RECENT_LIST_KEY, []).filter((b) => b.key !== key));
     booksStore('readwrite', (store) => store.delete(key)).catch(() => {});
   }
 
@@ -1411,7 +1638,7 @@
     if (!prev || !next) return '\n';
     if (/\p{L}-$/u.test(prev.text)) return '';
     const lastWord = prev.text.toLowerCase().match(/[\p{L}']+$/u)?.[0];
-    if (lastWord && DANGLING[cfg.source].has(lastWord)) return ' '; // "…se lo dijo a" + "María…"
+    if (lastWord && DANGLING[pageLang().source].has(lastWord)) return ' '; // "…se lo dijo a" + "María…"
     if (/\d$/.test(prev.text)) return '\n'; // page numbers in a table of contents
     return wrapsOnto(prev, next, nearby) ? ' ' : '\n';
   }
@@ -1512,7 +1739,7 @@
       showChapter(lastPage);
       bar.status.append(el('span', 'pdfsep'), toc);
     }
-    bar.status.append(el('span', 'pdfsep'), themeButton('pdf'));
+    bar.status.append(el('span', 'pdfsep'), themeButton('pdf'), pill.el);
   }
 
   const PDF_PAGE_CSS = `
@@ -1808,7 +2035,7 @@
     picker.selectedIndex = currentEntry();
     save(); // so the recent-books list shows it even before you scroll
     zoomLabel.textContent = `${Math.round(epubReader.scale * 100)}%`;
-    bar.status.replaceChildren(zoomOut, zoomLabel, zoomIn, el('span', 'pdfsep'), picker, el('span', 'pdfsep'), themeButton('epub'));
+    bar.status.replaceChildren(zoomOut, zoomLabel, zoomIn, el('span', 'pdfsep'), picker, el('span', 'pdfsep'), themeButton('epub'), pill.el);
   }
 
   const EPUB_PAGE_CSS = `
@@ -1903,7 +2130,7 @@
   }
 
   const TEXT_PAGE_CSS = `
-    .lector-pastebar { position: sticky; top: 0; z-index: 1; padding: 12px 24px; background: #faf8f4;
+    .lector-pastebar { position: sticky; top: 0; z-index: 1; padding: 44px 24px 12px; background: #faf8f4; /* room for the direction pill */
       border-bottom: 1px solid #e4dfd5; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
     .lector-paste { display: block; box-sizing: border-box; width: 100%; max-width: 40em; height: 7.5em;
       margin: 0 auto; padding: 10px 12px; resize: vertical; font: 15px/1.5 system-ui, sans-serif;
@@ -1922,6 +2149,12 @@
     return e.composedPath().includes(host);
   }
 
+  // Words can be clicked on the page in reading mode, and in the quick translator's output always.
+  function clickableAt(e) {
+    if (inOurUi(e)) return e.composedPath().includes(quick.out);
+    return enabled && e.target instanceof Element && !isEditable(e.target);
+  }
+
   // While reading mode is on we replace the browser's own (blue) selection:
   // press + release on a word = translate that word,
   // press + drag = purple selection snapped to whole words, translated on release.
@@ -1931,8 +2164,7 @@
 
   document.addEventListener('mousedown', (e) => {
     swallowClick = false;
-    if (!enabled || e.button !== 0 || inOurUi(e)) return;
-    if (!(e.target instanceof Element) || isEditable(e.target)) return;
+    if (e.button !== 0 || !clickableAt(e)) return;
     const caret = caretAt(e.clientX, e.clientY);
     if (!caret) return;
     e.preventDefault(); // no native selection, no dragging links/images
@@ -1970,6 +2202,7 @@
   // hover: light purple on the word under the mouse
   let hoverRange = null;
   let frameQueued = false;
+  let hoverAllowed = false; // the mouse is over clickable text (see clickableAt)
   let mouseX = 0;
   let mouseY = 0;
 
@@ -2002,12 +2235,11 @@
 
   function onFrame() {
     frameQueued = false;
-    if (!enabled) return;
-    if (drag) updateDrag(); else updateHover();
+    if (drag) updateDrag(); else if (hoverAllowed) updateHover();
   }
 
   document.addEventListener('mousemove', (e) => {
-    if (!enabled) return;
+    if (!enabled && quick.box.hidden) return;
     mouseX = e.clientX;
     mouseY = e.clientY;
     if (drag && !drag.moved) {
@@ -2016,7 +2248,8 @@
       hideTip();
       clearHover();
     }
-    if (!drag && (inOurUi(e) || (e.target instanceof Element && isEditable(e.target)))) {
+    hoverAllowed = clickableAt(e);
+    if (!drag && !hoverAllowed) {
       clearHover();
       return;
     }
@@ -2029,9 +2262,10 @@
   document.addEventListener('keydown', (e) => {
     if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === HOTKEY) {
       e.preventDefault();
-      setEnabled(!enabled);
+      if (e.shiftKey) toggleQuickBox(); else setEnabled(!enabled);
     } else if (e.key === 'Escape') {
-      hideTip();
+      if (!tipEl.hidden) hideTip(); // a popup first, then the quick translator
+      else if (!quick.box.hidden) closeQuickBox();
     }
   }, true);
 

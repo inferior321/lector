@@ -6,24 +6,25 @@ Lector is a userscript. Turn on reading mode on any web page, click a word (or d
 
 ## Install
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
-2. Chrome, Brave, Edge and other Chromium browsers: open the extensions page (`brave://extensions`, `chrome://extensions`, …), click **Details** on Tampermonkey and turn on **Allow User Scripts**.
-3. Open **[lector.user.js](https://raw.githubusercontent.com/inferior321/lector/main/lector.user.js)**. Tampermonkey shows its install page; click **Install**.
+1. Install a userscript manager in your browser: [Violentmonkey](https://violentmonkey.github.io/) or [Tampermonkey](https://www.tampermonkey.net/).
+   - Tampermonkey in Chrome, Brave, Edge and other Chromium browsers also needs this: open the extensions page (`brave://extensions`, `chrome://extensions`, …), click **Details** on Tampermonkey and turn on **Allow User Scripts**.
+2. Open **[lector.user.js](https://raw.githubusercontent.com/inferior321/lector/main/lector.user.js)**. The manager shows its install page; click **Install**.
 
-Tampermonkey checks this address for new versions and updates the script by itself (about once a day, or right away with *Tampermonkey → Utilities → Check for userscript updates*).
+The manager checks this address for new versions and updates the script by itself (about once a day; its dashboard can also check right away).
 
 ## Use
 
 | | |
 |---|---|
 | **Alt+T** | Turn reading mode on/off (it starts off on every page) |
+| **ES → EN ⇄ ✕** at the top | Shown while reading mode is on (in the book reader, at the end of its top bar). **⇄** swaps the direction to English → Spanish and back, for this tab only: reloading keeps it, a new tab starts Spanish → English. **✕** turns reading mode off. It turns amber with a countdown while Google is busy |
+| **Alt+Shift+T** | The Lector panel, at the top of the page: <br>• **A quick translator** with its own direction, starting opposite to the tab's. Type or paste, **Enter** translates (**Shift+Enter** for a new line). Click a word in the translation for the usual popup, back in the language you typed in. **⇄** swaps the direction and translates the translation back; **🔊** reads it aloud. It keeps its text until you close the tab <br>• **Open PDF/EPUB** and **Read pasted text** open those readers in a new tab; **Reading mode** turns it on/off <br>• **Continue reading**: your last books, each reopens in a new tab where you left off <br>**Esc**, **✕**, Alt+Shift+T or a click outside close it |
 | **Click a word** | Translate it in context |
 | **Drag across words** | Translate a phrase (the selection snaps to whole words) |
-| **Esc** | Close the popup |
+| **Esc** | Close the popup (then the Lector panel) |
 | | Words and phrases you've looked up get a dotted purple underline everywhere they appear on the page (shown only in reading mode). On web pages they clear when you reload; in the reader tabs they last until you close the tab |
-| Tampermonkey menu → **Open a PDF or EPUB to read…** | Opens a reader tab: pick a PDF or EPUB book and read it with the same click-to-translate. Your last 5 books are listed under **Continue reading** and reopen with one click, at the same spot and zoom; reloading the tab reopens the book you were reading. A chapter list follows the book's own table of contents (or the PDF's outline), and ☾ switches to dark mode (PDF pages are shown with inverted colours) |
-| Tampermonkey menu → **Read pasted text…** | Opens a reader tab with a box at the top: paste or type any text (an email, a message, a site where clicking doesn't work) and it appears below, ready to click. Edits show up as soon as you pause typing; Ctrl+V anywhere on the page replaces the text |
-| Tampermonkey menu → **Swap direction** | Spanish → English (default) or English → Spanish |
+| Panel → **Open PDF/EPUB** (also in the userscript menu) | Opens a reader tab: pick a PDF or EPUB book and read it with the same click-to-translate. Your last 5 books are listed under **Continue reading** and reopen with one click, at the same spot and zoom; reloading the tab reopens the book you were reading. A chapter list follows the book's own table of contents (or the PDF's outline), and ☾ switches to dark mode (PDF pages are shown with inverted colours) |
+| Panel → **Read pasted text** (also in the userscript menu) | Opens a reader tab with a box at the top: paste or type any text (an email, a message, a site where clicking doesn't work) and it appears below, ready to click. Edits show up as soon as you pause typing; Ctrl+V anywhere on the page replaces the text |
 
 ### The popup
 
@@ -54,12 +55,16 @@ Google translates whole sentences, so Lector works out which part of the transla
 
 ## Good to know
 
-- **Privacy:** each lookup sends the sentence around the word to Google Translate. Keep reading mode off on private pages (email, banking).
-- Lector uses Google Translate's free, unofficial web addresses. Google may limit heavy use for a few minutes. Lector then switches to a second address, and the corner badge turns amber with a countdown if both are busy.
-- Translations are cached in Tampermonkey's storage, so repeat lookups are instant.
+- **Privacy:** each lookup sends the sentence around the word to Google Translate, and the quick translator sends what you typed when you press Enter. Keep reading mode off on private pages (email, banking).
+- Lector uses Google Translate's free, unofficial web addresses. Google may limit heavy use for a few minutes. Lector then switches to a second address, and the direction pill at the top turns amber with a countdown if both are busy.
+- Translations are cached in the userscript manager's storage, so repeat lookups are instant.
 - Your last 5 books are kept as files in the reader page's own browser storage (on this computer only), so they reopen without the file picker. Remove one with its ✕.
 - The book and text readers run on `example.com`, a plain page that doesn't block them. The PDF reader uses [PDF.js](https://mozilla.github.io/pdf.js/) (downloaded once from cdnjs and cached).
 - Doesn't work inside embedded frames, on text drawn as images (e.g. Google Docs), in scanned PDFs, or in copy-protected (DRM) ebooks such as Kindle books.
+
+## Tests
+
+`node tests/tests.mjs` runs the script in headless Brave (the Flatpak `com.brave.Browser`; needs Node 22+ and openssl) against a sample page, the text reader and a small EPUB, with Google faked so no network is needed. Add part of a test's name to run just those tests.
 
 ## License
 

@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>Prueba</title>
+<style>body { font: 18px/1.6 Georgia, serif; margin: 120px 40px 40px; } p { max-width: 40em; }</style></head>
+<body>
+<p id="p1">Me senté en el banco del parque. Hacía mucho frío.</p>
+<p id="p2">Ayer pasamos genial con mis amigos.</p>
+<input id="field" placeholder="page field">
+<div style="height: 2000px"></div>
+<script>
+  window.__pageKeys = [];
+  document.addEventListener('keydown', (e) => window.__pageKeys.push(e.key));
+  window.addEventListener('keypress', (e) => window.__pageKeys.push('press:' + e.key));
+</script>
+</body></html>
