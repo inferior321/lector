@@ -171,34 +171,62 @@ test('panel opens centered under the pill, opposite direction of the tab, input 
   return tab;
 });
 
-test('clicking outside closes the panel (text kept); clicks in a word popup don\'t', async (cdp) => {
+test('clicking the page leaves the panel open, and page words still translate', async (cdp) => {
   const tab = await openPage(cdp);
+  await tab.key('t', { alt: true });
   await tab.key('t', { alt: true, shift: true });
   await tab.type('the bench');
-  await tab.key('Enter');
-  await sleep(200);
-  await clickWord(tab, 'bench', true);
-  await sleep(200);
-  const say = await tab.eval(`(() => { const r = __q('.tip .say').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
-  await tab.click(say.x, say.y);
-  assert(await tab.eval(`__visible('.qbox')`), 'popup click keeps the panel');
+  await clickWord(tab, 'banco');
+  assert(await tab.eval('__tipVisible()'), 'page word translated');
+  assert(await tab.eval(`__visible('.qbox')`), 'panel still open after a word click');
   await tab.click(900, 450);
-  assert(!(await tab.eval(`__visible('.qbox')`)), 'outside click closes');
-  await tab.key('t', { alt: true, shift: true });
-  eq(await tab.eval(`__q('.qin').value`), 'the bench', 'text kept');
+  assert(await tab.eval(`__visible('.qbox')`), 'panel still open after a blank click');
+  eq(await tab.eval(`__q('.qin').value`), 'the bench', 'text untouched');
   return tab;
 });
 
-test('reading-mode button switches reading mode and closes the panel', async (cdp) => {
+test('Reading button switches reading mode, panel stays open, label follows (also Alt+T)', async (cdp) => {
   const tab = await openPage(cdp);
   await tab.key('t', { alt: true, shift: true });
-  assert(/off/i.test(await tab.eval(`__q('.qreading').textContent`)), 'says off');
+  eq(await tab.eval(`__q('.qreading').textContent`), 'Reading: off', 'label off');
   const b = await tab.eval(`__rect('.qreading')`);
   await tab.click(b.cx, b.cy);
   assert(await tab.eval(`__visible('.dirpill')`), 'reading mode on');
-  assert(!(await tab.eval(`__visible('.qbox')`)), 'panel closed');
+  assert(await tab.eval(`__visible('.qbox')`), 'panel stays open');
+  eq(await tab.eval(`__q('.qreading').textContent`), 'Reading: on', 'label on');
+  await tab.key('t', { alt: true });
+  eq(await tab.eval(`__q('.qreading').textContent`), 'Reading: off', 'label follows Alt+T');
+  return tab;
+});
+
+test('the three buttons sit on one line', async (cdp) => {
+  const tab = await openPage(cdp);
   await tab.key('t', { alt: true, shift: true });
-  assert(/on/i.test(await tab.eval(`__q('.qreading').textContent`)), 'says on');
+  const rs = await tab.eval(`['.qopenbook', '.qopentext', '.qreading'].map(__rect)`);
+  const box = await tab.eval(`__rect('.qbox')`);
+  assert(rs.every((r) => Math.abs(r.y - rs[0].y) < 2), `same row: ${JSON.stringify(rs.map((r) => r.y))}`);
+  assert(rs.every((r) => r.x >= box.x && r.x + r.w <= box.x + box.w), 'inside the panel');
+  eq(await tab.eval(`[__q('.qopenbook').textContent, __q('.qopentext').textContent]`), ['📖 PDF/EPUB', '📝 Pasted text'], 'short labels');
+  return tab;
+});
+
+test('dragging the header moves the panel, and every tab reopens it there', async (cdp) => {
+  const tab = await openPage(cdp);
+  await tab.key('t', { alt: true, shift: true });
+  const h = await tab.eval(`__rect('.qhead')`);
+  await tab.drag(h.x + 60, h.cy, 300, 400);
+  const r = await tab.eval(`__rect('.qbox')`);
+  assert(Math.abs(r.x - (300 - 60)) < 6 && Math.abs(r.y - (400 - (h.cy - h.y))) < 6, `moved, got ${JSON.stringify(r)}`);
+  await tab.key('t', { alt: true, shift: true });
+  await tab.key('t', { alt: true, shift: true });
+  const again = await tab.eval(`__rect('.qbox')`);
+  assert(Math.abs(again.x - r.x) < 2 && Math.abs(again.y - r.y) < 2, 'reopens where it was left');
+  const other = await openPage(cdp);
+  await other.key('t', { alt: true, shift: true });
+  const r2 = await other.eval(`__rect('.qbox')`);
+  assert(Math.abs(r2.x - r.x) < 2 && Math.abs(r2.y - r.y) < 2, `remembered in other tab, got ${JSON.stringify(r2)}`);
+  await other.eval(`GM_setValue('panelPos', null)`); // later tests expect the first-time spot
+  await other.close();
   return tab;
 });
 

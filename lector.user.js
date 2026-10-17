@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.8.0
+// @version      1.9.0
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode; Alt+Shift+T opens a quick translator.
 // @author       inferior321
 // @license      MIT
@@ -636,11 +636,11 @@
         padding: 0 0 0 8px; box-shadow: none; }
       .readerbar .dirpill button { padding: 0 6px; background: transparent; }
       .readerbar .dirpill button:hover { background: rgba(255,255,255,.2); }
-      .qbox { position: fixed; z-index: 2; top: 48px; left: 50%; transform: translateX(-50%);
+      .qbox { position: fixed; z-index: 2;
         width: min(440px, calc(100vw - 32px)); box-sizing: border-box; overflow: hidden;
         background: #1f2430; color: #f2f2f2; font: 14px/1.4 system-ui, sans-serif;
         border-radius: 10px; box-shadow: 0 8px 28px rgba(0,0,0,.45); }
-      .qhead { display: flex; align-items: center; gap: 6px; padding: 6px 6px 6px 12px;
+      .qhead { display: flex; align-items: center; gap: 6px; padding: 6px 6px 6px 12px; cursor: move;
         background: #2a3040; user-select: none; }
       .qdir { font-size: 12px; font-weight: 600; color: #c9b8f0; letter-spacing: .02em; }
       .qhead button { all: unset; cursor: pointer; padding: 1px 7px; border-radius: 5px; color: #d6dbe4; }
@@ -655,7 +655,7 @@
         font-size: 15px; cursor: default; }
       .qout:empty::before { content: 'Press Enter to translate'; color: #6f7a8c; font-size: 13px; }
       .qout.err { color: #ff8a80; font-size: 13px; }
-      .qactions { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 12px; border-top: 1px solid #343b4b; }
+      .qactions { display: flex; gap: 6px; padding: 10px 12px; border-top: 1px solid #343b4b; }
       .qactions button, .qbook { all: unset; cursor: pointer; border-radius: 6px; font-size: 13px; }
       .qactions button { padding: 4px 10px; background: #343b4b; }
       .qactions button:hover { background: #46506a; }
@@ -1060,6 +1060,7 @@
     else { hideTip(); clearHover(); CSS.highlights?.delete('lector-seen'); }
     pill.el.hidden = !on;
     updatePill();
+    showReadingButton();
   }
 
   // ---------- direction pill ----------
@@ -1098,20 +1099,23 @@
   }
 
   // ---------- Lector panel (Alt+Shift+T) ----------
-  // Centered under the direction pill. A quick translator on top, then shortcuts:
+  // Opens centered under the direction pill (drag its header to move it; every tab reopens it
+  // where it was left). A quick translator on top, then shortcuts:
   //   ┌ EN → ES   ⇄                          ✕ ┐
   //   │ [ how do I say this?                 ] │   Enter translates, Shift+Enter starts a new line
   //   │ ¿cómo digo esto?                    🔊 │   click a word for the popup (back into the input language)
   //   ├──────────────────────────────────────────┤
-  //   │ [📖 Open PDF/EPUB] [📝 Read pasted text] │   new tabs
-  //   │ [Reading mode: off · turn on]           │
+  //   │ [📖 PDF/EPUB] [📝 Pasted text] [Reading: off] │   the first two open new tabs
   //   │ Continue reading                         │   the last books, each reopens in a new tab
   //   │   Cien años de soledad      Capítulo 4   │
   //   └──────────────────────────────────────────┘
   // The translator's direction starts opposite to the tab's (reading Spanish → write in
   // Spanish); its text and direction are kept in the tab's storage (back after closing the
-  // panel or reloading). Esc, ✕, Alt+Shift+T or a click outside close the panel.
+  // panel or reloading). It stays open until Esc, ✕ or Alt+Shift+T (or a button that opens a
+  // new tab).
   const QUICK_TAB_KEY = 'lector-quick';
+  const PANEL_POS_KEY = 'panelPos';
+  const PANEL_TOP_PX = 48; // first-time spot: just under the direction pill
   const quick = (() => {
     const box = el('div', 'qbox');
     box.hidden = true;
@@ -1129,14 +1133,17 @@
     const out = el('div', 'qout');
     row.append(out);
     const actions = el('div', 'qactions');
-    const openBook = el('button', 'qopenbook', '📖 Open PDF/EPUB');
-    const openText = el('button', 'qopentext', '📝 Read pasted text');
+    const openBook = el('button', 'qopenbook', '📖 PDF/EPUB');
+    openBook.title = 'Open a PDF or EPUB to read (new tab)';
+    const openText = el('button', 'qopentext', '📝 Pasted text');
+    openText.title = 'Read pasted text (new tab)';
     const reading = el('button', 'qreading');
+    reading.title = 'Turn reading mode on/off (Alt+T)';
     actions.append(openBook, openText, reading);
     const books = el('div', 'qbooks');
     box.append(head, input, row, actions, books);
     shadow.append(box);
-    return { box, dir, swap, close, input, row, out, openBook, openText, reading, books, say: null, reversed: false, opened: false };
+    return { box, head, dir, swap, close, input, row, out, openBook, openText, reading, books, say: null, reversed: false, opened: false };
   })();
 
   function toggleQuickBox() {
@@ -1144,6 +1151,7 @@
     if (!quick.opened) restoreQuickBox();
     showPanelShortcuts();
     quick.box.hidden = false;
+    placeQuickBox(GM_getValue(PANEL_POS_KEY, null));
     quick.input.focus();
   }
 
@@ -1200,7 +1208,7 @@
 
   // Reading mode button and the Continue reading list, as they are right now.
   function showPanelShortcuts() {
-    quick.reading.textContent = enabled ? 'Reading mode: on · turn off' : 'Reading mode: off · turn on';
+    showReadingButton();
     quick.books.replaceChildren();
     const recent = GM_getValue(RECENT_LIST_KEY, []);
     if (!recent.length) return;
@@ -1212,6 +1220,39 @@
       quick.books.append(open);
     }
   }
+
+  function showReadingButton() {
+    quick.reading.textContent = enabled ? 'Reading: on' : 'Reading: off';
+  }
+
+  // Centered under the pill unless it was dragged somewhere; always kept inside the window.
+  function placeQuickBox(pos) {
+    const { box } = quick;
+    const maxLeft = Math.max(0, window.innerWidth - box.offsetWidth);
+    const maxTop = Math.max(0, window.innerHeight - box.offsetHeight);
+    const left = pos ? pos.left : maxLeft / 2;
+    const top = pos ? pos.top : PANEL_TOP_PX;
+    box.style.left = `${Math.min(Math.max(0, left), maxLeft)}px`;
+    box.style.top = `${Math.min(Math.max(0, top), maxTop)}px`;
+  }
+
+  quick.head.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || e.target.closest('button')) return;
+    e.preventDefault();
+    const start = quick.box.getBoundingClientRect();
+    const dx = e.clientX - start.left;
+    const dy = e.clientY - start.top;
+    quick.head.setPointerCapture(e.pointerId);
+    const move = (m) => placeQuickBox({ left: m.clientX - dx, top: m.clientY - dy });
+    const end = () => {
+      quick.head.removeEventListener('pointermove', move);
+      const r = quick.box.getBoundingClientRect();
+      GM_setValue(PANEL_POS_KEY, { left: Math.round(r.left), top: Math.round(r.top) });
+    };
+    quick.head.addEventListener('pointermove', move);
+    quick.head.addEventListener('pointerup', end, { once: true });
+  });
+  window.addEventListener('resize', () => { if (!quick.box.hidden) placeQuickBox(GM_getValue(PANEL_POS_KEY, null)); });
 
   quick.input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); translateQuickBox(); }
@@ -1230,8 +1271,7 @@
   // In a reader tab that hasn't opened anything yet, these show its file picker / paste box.
   quick.openBook.onclick = () => { closeQuickBox(); if (isReaderTab && !bookOpen) openBookReader(); else openReaderTab(READER_URL); };
   quick.openText.onclick = () => { closeQuickBox(); if (isTextTab) openTextReader(); else openReaderTab(TEXT_READER_URL); };
-  quick.reading.onclick = () => { closeQuickBox(); setEnabled(!enabled); };
-  document.addEventListener('mousedown', (e) => { if (!quick.box.hidden && !inOurUi(e)) closeQuickBox(); }, true);
+  quick.reading.onclick = () => setEnabled(!enabled);
 
   // Is (x, y) over the quick translator's output text?
   function quickOutAt(x, y) {
