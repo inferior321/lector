@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.9.1
+// @version      1.9.2
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode; Alt+Shift+T opens a quick translator.
 // @author       inferior321
 // @license      MIT
@@ -38,12 +38,16 @@
   };
 
   // ---------- direction ----------
-  // Each tab has its own direction (the ⇄ on the top pill), kept across reloads; a new tab
-  // starts Spanish → English. Every lookup takes a { source, target } pair along with it, so
+  // Each tab has its own direction (the ⇄ on the top pill), kept across reloads. A new tab
+  // starts with the last one chosen anywhere (Spanish → English until you first swap); tabs
+  // already open keep theirs. Every lookup takes a { source, target } pair along with it, so
   // a page lookup and a quick-translator lookup running at the same time can't mix them up.
   const DIRECTION_TAB_KEY = 'lector-reversed';
+  const PAGE_DIRECTION_KEY = 'pageReversed';
   const langPair = (reversed) => (reversed ? { source: 'en', target: 'es' } : { source: 'es', target: 'en' });
-  let tabReversed = tabStore.get(DIRECTION_TAB_KEY) === '1';
+  const savedTabDirection = tabStore.get(DIRECTION_TAB_KEY);
+  let tabReversed = savedTabDirection ? savedTabDirection === '1' : GM_getValue(PAGE_DIRECTION_KEY, false);
+  tabStore.set(DIRECTION_TAB_KEY, tabReversed ? '1' : '0'); // a reload keeps it, whatever other tabs choose
   const pageLang = () => langPair(tabReversed);
 
   const GOOGLE_BACKOFF_MS = 120_000;
@@ -1078,6 +1082,7 @@
     swap.onclick = () => {
       tabReversed = !tabReversed;
       tabStore.set(DIRECTION_TAB_KEY, tabReversed ? '1' : '0');
+      GM_setValue(PAGE_DIRECTION_KEY, tabReversed);
       hideTip();
       updatePill();
     };
@@ -1110,11 +1115,12 @@
   //   │ Continue reading                         │   the last books, each reopens in a new tab
   //   │   Cien años de soledad      Capítulo 4   │
   //   └──────────────────────────────────────────┘
-  // The translator's direction starts opposite to the tab's (reading Spanish → write in
-  // Spanish); its text and direction are kept in the tab's storage (back after closing the
-  // panel or reloading). It stays open until Esc, ✕ or Alt+Shift+T (or a button that opens a
+  // The translator's direction is the last one chosen in it anywhere (English → Spanish until
+  // you first swap: reading Spanish → write in Spanish). Its text, and the direction that text
+  // was translated in, are kept in the tab's storage (back after closing the panel or reloading). It stays open until Esc, ✕ or Alt+Shift+T (or a button that opens a
   // new tab).
   const QUICK_TAB_KEY = 'lector-quick';
+  const PANEL_DIRECTION_KEY = 'panelReversed';
   const PANEL_POS_KEY = 'panelPos';
   const PANEL_TOP_PX = 48; // first-time spot: just under the direction pill
   const quick = (() => {
@@ -1162,12 +1168,12 @@
     clearHover();
   }
 
-  // First opening in this tab: last text from the tab's storage, or empty and opposite to the tab.
+  // First opening in this tab: last text from the tab's storage, or empty in the last-chosen direction.
   function restoreQuickBox() {
     quick.opened = true;
     let saved = null;
     try { saved = JSON.parse(tabStore.get(QUICK_TAB_KEY)); } catch { /* nothing usable saved */ }
-    quick.reversed = saved ? !!saved.reversed : !tabReversed;
+    quick.reversed = saved ? !!saved.reversed : GM_getValue(PANEL_DIRECTION_KEY, true);
     quick.input.value = saved?.input || '';
     showQuickOutput(saved?.output || '');
   }
@@ -1282,6 +1288,7 @@
   quick.swap.onclick = () => {
     const translation = quick.out.classList.contains('err') ? '' : quick.out.textContent;
     quick.reversed = !quick.reversed;
+    GM_setValue(PANEL_DIRECTION_KEY, quick.reversed);
     if (translation && translation !== '…') quick.input.value = translation;
     translateQuickBox();
     quick.input.focus();

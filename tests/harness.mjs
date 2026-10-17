@@ -95,7 +95,7 @@ class Cdp {
 }
 
 // ---------- GM stand-ins (run in the page before the userscript) ----------
-const gmStore = new Map(); // shared by every tab, like the userscript manager's storage
+export const gmStore = new Map(); // shared by every tab, like the userscript manager's storage
 function shimSource() {
   return `
     window.__menu = [];

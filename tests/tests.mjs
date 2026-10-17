@@ -2,7 +2,7 @@
 // Run from the repo: node tests/tests.mjs [part of a test name]
 // Google is faked (it answers '<tl>' + the text), so no network is needed; a screenshot of
 // each test's last state is saved in tests/shots/.
-import { startServer, openBrowser, Tab, pageUrl, sleep, nextNewTab } from './harness.mjs';
+import { startServer, openBrowser, Tab, pageUrl, sleep, nextNewTab, gmStore } from './harness.mjs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
@@ -109,18 +109,56 @@ test('⇄ swaps to EN → ES and lookups follow', async (cdp) => {
   return tab;
 });
 
-test('direction is per tab: kept on reload, new tabs start ES → EN', async (cdp) => {
+test('page direction: new tabs start with your last choice, open tabs keep theirs', async (cdp) => {
   const tab = await openPage(cdp);
+  const before = await openPage(cdp); // already open when the swap happens
   await tab.key('t', { alt: true });
   const s = await tab.eval(`__rect('.dirswap')`);
   await tab.click(s.cx, s.cy);
   await tab.reload(); await prep(tab);
   await tab.key('t', { alt: true });
   eq(await tab.eval(`__q('.dirlabel').textContent`), 'EN → ES', 'kept after reload');
+  await before.reload(); await prep(before);
+  await before.key('t', { alt: true });
+  eq(await before.eval(`__q('.dirlabel').textContent`), 'ES → EN', 'a tab open before the swap keeps its own');
+  await before.close();
+  const after = await openPage(cdp);
+  await after.key('t', { alt: true });
+  eq(await after.eval(`__q('.dirlabel').textContent`), 'EN → ES', 'a new tab starts with the last choice');
+  await after.close();
+  return tab;
+});
+
+test('panel direction: a new tab starts with the panel\'s last choice', async (cdp) => {
+  const tab = await openPage(cdp);
+  await tab.key('t', { alt: true, shift: true });
+  eq(await tab.eval(`__q('.qdir').textContent`), 'EN → ES', 'first-time panel direction');
+  const s = await tab.eval(`__rect('.qswap')`);
+  await tab.click(s.cx, s.cy);
+  eq(await tab.eval(`__q('.qdir').textContent`), 'ES → EN', 'swapped');
   const other = await openPage(cdp);
-  await other.key('t', { alt: true });
-  eq(await other.eval(`__q('.dirlabel').textContent`), 'ES → EN', 'new tab default');
+  await other.key('t', { alt: true, shift: true });
+  eq(await other.eval(`__q('.qdir').textContent`), 'ES → EN', 'remembered in a new tab');
+  eq(await other.eval(`__q('.dirlabel').textContent`), 'ES → EN', 'page direction untouched');
   await other.close();
+  return tab;
+});
+
+test('a tab\'s saved panel text comes back with its own direction', async (cdp) => {
+  const tab = await openPage(cdp);
+  await tab.key('t', { alt: true, shift: true });
+  await tab.type('hello');
+  await tab.key('Enter'); // saved in this tab as EN → ES
+  await sleep(200);
+  const other = await openPage(cdp);
+  await other.key('t', { alt: true, shift: true });
+  const s = await other.eval(`__rect('.qswap')`);
+  await other.click(s.cx, s.cy); // last panel choice is now ES → EN
+  await other.close();
+  await tab.reload(); await prep(tab);
+  await tab.key('t', { alt: true, shift: true });
+  eq(await tab.eval(`__q('.qin').value`), 'hello', 'text back');
+  eq(await tab.eval(`__q('.qdir').textContent`), 'EN → ES', 'with the direction it was translated in');
   return tab;
 });
 
@@ -474,6 +512,7 @@ const { brave, cdp } = await openBrowser();
 let failed = 0;
 for (const t of tests.filter((t) => t.name.includes(filter))) {
   let tab;
+  for (const k of ['pageReversed', 'panelReversed']) gmStore.delete(k); // each test starts with no remembered directions
   try {
     tab = await t.fn(cdp);
     const errs = tab?.errors || [];
