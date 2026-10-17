@@ -337,6 +337,27 @@ test('🔊 reads the output in the output language', async (cdp) => {
   return tab;
 });
 
+test('📋 copies the translation, and only shows when there is one', async (cdp) => {
+  const tab = await openPage(cdp);
+  await tab.key('t', { alt: true, shift: true });
+  assert(!(await tab.eval(`__visible('.qcopy')`)), 'no copy button before translating');
+  await tab.type('good morning');
+  await tab.key('Enter');
+  await sleep(200);
+  const c = await tab.eval(`__rect('.qcopy')`);
+  await tab.click(c.cx, c.cy);
+  eq(await tab.eval('window.__clipboard'), '<es>good morning', 'copied text');
+  eq(await tab.eval(`__q('.qcopy').textContent`), '✓', 'confirms');
+  await sleep(1600);
+  eq(await tab.eval(`__q('.qcopy').textContent`), '📋', 'back to 📋');
+  await tab.eval('window.__fakeStatus = 429');
+  await tab.type(' again');
+  await tab.key('Enter');
+  await sleep(200);
+  assert(!(await tab.eval(`__visible('.qcopy')`)), 'no copy button for an error');
+  return tab;
+});
+
 test('✕ closes the box; reopening (and reloading) keeps text and direction in this tab', async (cdp) => {
   const tab = await openPage(cdp);
   await tab.key('t', { alt: true, shift: true });

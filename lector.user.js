@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.9.0
+// @version      1.9.1
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode; Alt+Shift+T opens a quick translator.
 // @author       inferior321
 // @license      MIT
@@ -13,6 +13,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
 // @connect      translate.googleapis.com
 // @connect      clients5.google.com
 // @run-at       document-idle
@@ -1103,7 +1104,7 @@
   // where it was left). A quick translator on top, then shortcuts:
   //   ┌ EN → ES   ⇄                          ✕ ┐
   //   │ [ how do I say this?                 ] │   Enter translates, Shift+Enter starts a new line
-  //   │ ¿cómo digo esto?                    🔊 │   click a word for the popup (back into the input language)
+  //   │ ¿cómo digo esto?                 📋 🔊 │   click a word for the popup (back into the input language)
   //   ├──────────────────────────────────────────┤
   //   │ [📖 PDF/EPUB] [📝 Pasted text] [Reading: off] │   the first two open new tabs
   //   │ Continue reading                         │   the last books, each reopens in a new tab
@@ -1143,7 +1144,7 @@
     const books = el('div', 'qbooks');
     box.append(head, input, row, actions, books);
     shadow.append(box);
-    return { box, head, dir, swap, close, input, row, out, openBook, openText, reading, books, say: null, reversed: false, opened: false };
+    return { box, head, dir, swap, close, input, row, out, openBook, openText, reading, books, copy: null, say: null, reversed: false, opened: false };
   })();
 
   function toggleQuickBox() {
@@ -1180,13 +1181,30 @@
     quick.dir.textContent = `${source.toUpperCase()} → ${target.toUpperCase()}`;
     quick.out.textContent = text;
     quick.out.classList.toggle('err', isError);
+    quick.copy?.remove();
     quick.say?.remove();
-    quick.say = null;
-    if (text && !isError) {
+    quick.copy = quick.say = null;
+    if (text && !isError && text !== '…') {
+      quick.copy = copyButton(text);
       quick.say = sayButton(text, target);
       quick.say.classList.add('qsay');
-      quick.row.append(quick.say);
+      quick.row.append(quick.copy, quick.say);
     }
+  }
+
+  // 📋 → ✓ for a moment. The userscript manager's clipboard works on any page (the browser's
+  // own needs https).
+  const COPIED_SHOWN_MS = 1200;
+  function copyButton(text) {
+    const btn = el('button', 'say qcopy', '📋');
+    btn.title = 'Copy the translation';
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      GM_setClipboard(text, 'text');
+      btn.textContent = '✓';
+      setTimeout(() => { btn.textContent = '📋'; }, COPIED_SHOWN_MS);
+    };
+    return btn;
   }
 
   let quickId = 0;

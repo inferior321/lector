@@ -105,6 +105,7 @@ function shimSource() {
     function GM_getValue(k, d) { return k in __store ? __store[k] : d; }
     function GM_setValue(k, v) { __store[k] = v; window.__gmSet && window.__gmSet(JSON.stringify([k, v])); }
     function GM_registerMenuCommand(name, fn) { window.__menu.push({ name, fn }); }
+    function GM_setClipboard(text) { window.__clipboard = text; }
     function GM_xmlhttpRequest(o) {
       const u = new URL(o.url);
       const q = u.searchParams.get('q') || '';
