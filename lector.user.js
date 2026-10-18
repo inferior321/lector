@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.9.2
+// @version      1.10.0
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode; Alt+Shift+T opens a quick translator.
 // @author       inferior321
 // @license      MIT
@@ -660,6 +660,15 @@
         font-size: 15px; cursor: default; }
       .qout:empty::before { content: 'Press Enter to translate'; color: #6f7a8c; font-size: 13px; }
       .qout.err { color: #ff8a80; font-size: 13px; }
+      .qwords { padding: 6px 10px 10px 12px; border-top: 1px solid #343b4b; }
+      .qwordshead { display: flex; align-items: center; color: #9aa3b5; font-size: 12px; margin-bottom: 2px; }
+      .qwordsclear { all: unset; cursor: pointer; padding: 1px 7px; border-radius: 5px; }
+      .qwordsclear:hover { background: #46506a; color: #d6dbe4; }
+      .qwordrows { max-height: 30vh; overflow: auto; }
+      .qwordrow { display: flex; align-items: baseline; gap: 2px; padding: 2px 0; }
+      .qwordtext { flex: 1; overflow-wrap: anywhere; }
+      .qword { font-weight: 600; }
+      .qwordanswer { color: #d6dbe4; }
       .qactions { display: flex; gap: 6px; padding: 10px 12px; border-top: 1px solid #343b4b; }
       .qactions button, .qbook { all: unset; cursor: pointer; border-radius: 6px; font-size: 13px; }
       .qactions button { padding: 4px 10px; background: #343b4b; }
@@ -848,6 +857,7 @@
     const base = result.base && result.base.toLowerCase() !== phrase.toLowerCase() ? result.base : '';
     renderTip(phrase, result.kind, result.text, details, base);
     tipEl.querySelector('.orig').append(sayButton(phrase, lang.source));
+    if (!inQuickBox) tipEl.querySelector('.orig').append(saveButton({ text: phraseText, base, answer: result.text, lang: lang.source }));
     if (result.kind !== 'fallback' && ctx && result.sentence) tipEl.append(sentenceToggle(pair, rect));
     tipEl.append(dictionaryLink(phraseText));
     placeTip(rect);
@@ -1110,6 +1120,8 @@
   //   ┌ EN → ES   ⇄                          ✕ ┐
   //   │ [ how do I say this?                 ] │   Enter translates, Shift+Enter starts a new line
   //   │ ¿cómo digo esto?                 📋 🔊 │   click a word for the popup (back into the input language)
+  //   │ Word list                    Clear all │   words saved with + on the popup, newest first
+  //   │   como · comer — I eat           🔊 ✕ │   (hidden while empty)
   //   ├──────────────────────────────────────────┤
   //   │ [📖 PDF/EPUB] [📝 Pasted text] [Reading: off] │   the first two open new tabs
   //   │ Continue reading                         │   the last books, each reopens in a new tab
@@ -1139,6 +1151,12 @@
     const row = el('div', 'qrow');
     const out = el('div', 'qout');
     row.append(out);
+    const words = el('div', 'qwords');
+    const wordsHead = el('div', 'qwordshead');
+    const clearWords = el('button', 'qwordsclear', 'Clear all');
+    wordsHead.append(el('span', 'qspace', 'Word list'), clearWords);
+    const wordRows = el('div', 'qwordrows');
+    words.append(wordsHead, wordRows);
     const actions = el('div', 'qactions');
     const openBook = el('button', 'qopenbook', '📖 PDF/EPUB');
     openBook.title = 'Open a PDF or EPUB to read (new tab)';
@@ -1148,9 +1166,9 @@
     reading.title = 'Turn reading mode on/off (Alt+T)';
     actions.append(openBook, openText, reading);
     const books = el('div', 'qbooks');
-    box.append(head, input, row, actions, books);
+    box.append(head, input, row, words, actions, books);
     shadow.append(box);
-    return { box, head, dir, swap, close, input, row, out, openBook, openText, reading, books, copy: null, say: null, reversed: false, opened: false };
+    return { box, head, dir, swap, close, input, row, out, words, clearWords, wordRows, openBook, openText, reading, books, copy: null, say: null, reversed: false, opened: false };
   })();
 
   function toggleQuickBox() {
@@ -1230,9 +1248,70 @@
     saveQuickBox();
   }
 
-  // Reading mode button and the Continue reading list, as they are right now.
+  // ---------- word list ----------
+  // Words and phrases saved with + on the popup, for review in the panel. Kept in the tab's
+  // storage like the translator's text: back after a reload, gone when the tab closes (and,
+  // like all tab storage, separate for each site visited in the tab). Newest first; a word is
+  // kept once per language, saving it again moves it to the top.
+  const WORDS_TAB_KEY = 'lector-words';
+  const wordKey = (w) => `${w.lang}:${w.text.toLowerCase()}`;
+
+  function savedWords() {
+    try { return JSON.parse(tabStore.get(WORDS_TAB_KEY)) || []; } catch { return []; }
+  }
+
+  function storeWords(words) {
+    tabStore.set(WORDS_TAB_KEY, JSON.stringify(words));
+    showWordList();
+    tipEl.querySelector('.save')?.show(); // an open popup's +/✓ follows the panel's ✕ and Clear all
+  }
+
+  const isSaved = (w) => savedWords().some((s) => wordKey(s) === wordKey(w));
+  const forgetWord = (w) => storeWords(savedWords().filter((s) => wordKey(s) !== wordKey(w)));
+
+  // + on the popup: saves the word and becomes ✓; ✓ removes it again.
+  function saveButton(word) {
+    const btn = el('button', 'say save');
+    const show = () => {
+      const saved = isSaved(word);
+      btn.textContent = saved ? '✓' : '+';
+      btn.title = saved ? 'Saved to the word list (click to remove)' : 'Save to the word list (Alt+Shift+T)';
+    };
+    btn.show = show;
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      if (isSaved(word)) forgetWord(word);
+      else storeWords([word, ...savedWords().filter((s) => wordKey(s) !== wordKey(word))]);
+    };
+    show();
+    return btn;
+  }
+
+  //   Word list                    Clear all
+  //   como · comer — I eat           🔊 ✕
+  function showWordList() {
+    const words = savedWords();
+    quick.words.hidden = !words.length;
+    quick.wordRows.replaceChildren(...words.map((w) => {
+      const row = el('div', 'qwordrow');
+      const text = el('span', 'qwordtext');
+      text.append(el('span', 'qword', w.text));
+      if (w.base) text.append(el('span', 'base', ` · ${w.base}`));
+      text.append(el('span', 'qwordanswer', ` — ${w.answer}`));
+      const say = sayButton(w.text, w.lang);
+      say.classList.add('qwordsay');
+      const remove = el('button', 'say qwordremove', '✕');
+      remove.title = 'Remove from the list';
+      remove.onclick = (e) => { e.stopPropagation(); forgetWord(w); };
+      row.append(text, say, remove);
+      return row;
+    }));
+  }
+
+  // Reading mode button, the word list and the Continue reading list, as they are right now.
   function showPanelShortcuts() {
     showReadingButton();
+    showWordList();
     quick.books.replaceChildren();
     const recent = GM_getValue(RECENT_LIST_KEY, []);
     if (!recent.length) return;
@@ -1297,6 +1376,7 @@
   quick.openBook.onclick = () => { closeQuickBox(); if (isReaderTab && !bookOpen) openBookReader(); else openReaderTab(READER_URL); };
   quick.openText.onclick = () => { closeQuickBox(); if (isTextTab) openTextReader(); else openReaderTab(TEXT_READER_URL); };
   quick.reading.onclick = () => setEnabled(!enabled);
+  quick.clearWords.onclick = () => storeWords([]);
 
   // Is (x, y) over the quick translator's output text?
   function quickOutAt(x, y) {

@@ -506,6 +506,116 @@ test('EPUB reader: the direction controls sit at the end of the reader bar', asy
   return tab;
 });
 
+// ---------- word list ----------
+async function clickUi(tab, sel) {
+  const r = await tab.eval(`__rect(${JSON.stringify(sel)})`);
+  if (!r) throw new Error(`not found: ${sel}`);
+  await tab.click(r.cx, r.cy);
+  await sleep(150);
+}
+const listWords = `[...__ui().querySelectorAll('.qword')].map((n) => n.textContent)`;
+
+test('+ on the popup saves the word and turns into ✓; ✓ removes it', async (cdp) => {
+  const tab = await openPage(cdp);
+  await tab.key('t', { alt: true });
+  await clickWord(tab, 'banco');
+  eq(await tab.eval(`__q('.tip .save').textContent`), '+', 'not saved yet');
+  await clickUi(tab, '.tip .save');
+  assert(await tab.eval('__tipVisible()'), 'popup stays open');
+  eq(await tab.eval(`__q('.tip .save').textContent`), '✓', 'saved');
+  await tab.key('t', { alt: true, shift: true });
+  eq(await tab.eval(listWords), ['banco'], 'in the panel list (updated while open)');
+  const main = await tab.eval(`__q('.tip .main').textContent`);
+  assert((await tab.eval(`__q('.qwordrow').textContent`)).includes(main), 'row has the translation');
+  await clickUi(tab, '.tip .save');
+  eq(await tab.eval(`__q('.tip .save').textContent`), '+', 'removed');
+  eq(await tab.eval(listWords), [], 'gone from the list');
+  assert(!(await tab.eval(`__visible('.qwords')`)), 'empty list hidden');
+  return tab;
+});
+
+test('a saved word shows ✓ when looked up again, newest first, and survives a reload', async (cdp) => {
+  const tab = await openPage(cdp);
+  await tab.key('t', { alt: true });
+  await clickWord(tab, 'banco');
+  await clickUi(tab, '.tip .save');
+  await clickWord(tab, 'parque');
+  await clickUi(tab, '.tip .save');
+  await clickWord(tab, 'banco');
+  eq(await tab.eval(`__q('.tip .save').textContent`), '✓', 'already saved');
+  await tab.reload(); await prep(tab);
+  await tab.key('t', { alt: true, shift: true });
+  eq(await tab.eval(listWords), ['parque', 'banco'], 'kept on reload, newest first');
+  const other = await openPage(cdp);
+  await other.key('t', { alt: true, shift: true });
+  eq(await other.eval(listWords), [], 'a new tab starts with no list');
+  await other.close();
+  return tab;
+});
+
+test('word list: ✕ removes one, Clear all empties it, 🔊 reads it in its language', async (cdp) => {
+  const tab = await openPage(cdp);
+  await tab.key('t', { alt: true });
+  for (const w of ['banco', 'parque', 'frío']) { await clickWord(tab, w); await clickUi(tab, '.tip .save'); }
+  await tab.key('Escape');
+  await tab.key('t', { alt: true, shift: true });
+  await clickUi(tab, '.qwordrow .qwordsay');
+  const r = await tab.eval(`__lastReq((r) => r.path.includes('translate_tts'))`);
+  eq([r.q, r.tl], ['frío', 'es'], 'speaks the newest word in Spanish');
+  await clickUi(tab, '.qwordrow .qwordremove');
+  eq(await tab.eval(listWords), ['parque', 'banco'], '✕ removed the newest');
+  await tab.key('Escape'); // the panel covers the paragraph
+  await clickWord(tab, 'frío');
+  assert(await tab.eval('__tipVisible()'), 'popup for frío');
+  eq(await tab.eval(`__q('.tip .save').textContent`), '+', 'removed words show + again');
+  await tab.key('Escape');
+  await tab.key('t', { alt: true, shift: true });
+  await tab.key('Escape');
+  await clickWord(tab, 'banco');
+  eq(await tab.eval(`__q('.tip .save').textContent`), '✓', 'banco still saved');
+  await tab.key('t', { alt: true, shift: true });
+  await clickUi(tab, '.qwordsclear');
+  eq(await tab.eval(listWords), [], 'cleared');
+  eq(await tab.eval(`__q('.tip .save').textContent`), '+', 'open popup follows Clear all');
+  await tab.reload(); await prep(tab);
+  await tab.key('t', { alt: true, shift: true });
+  eq(await tab.eval(listWords), [], 'still empty after reload');
+  return tab;
+});
+
+test('a dragged phrase can be saved', async (cdp) => {
+  const tab = await openPage(cdp);
+  await tab.key('t', { alt: true });
+  const a = await tab.eval(`__wordAt('mucho')`);
+  const b = await tab.eval(`__wordAt('frío')`);
+  await tab.drag(a.x - 10, a.y, b.x + 5, b.y);
+  await sleep(300);
+  await clickUi(tab, '.tip .save');
+  await tab.key('t', { alt: true, shift: true });
+  eq(await tab.eval(listWords), ['mucho frío'], 'phrase saved');
+  return tab;
+});
+
+test('no + on quick-translator popups, while loading, or on errors', async (cdp) => {
+  const tab = await openPage(cdp);
+  await tab.key('t', { alt: true, shift: true });
+  await tab.type('the bench');
+  await tab.key('Enter');
+  await sleep(200);
+  await clickWord(tab, 'bench', true);
+  await sleep(200);
+  assert(await tab.eval('__tipVisible()'), 'popup for output word');
+  assert(!(await tab.eval(`__q('.tip .save')`)), 'no + for the translator');
+  await tab.key('Escape');
+  await tab.key('Escape');
+  await tab.eval('window.__fakeStatus = 429');
+  await tab.key('t', { alt: true });
+  await clickWord(tab, 'banco');
+  assert(await tab.eval(`__q('.tip[data-kind="error"]')`), 'error popup');
+  assert(!(await tab.eval(`__q('.tip .save')`)), 'no + on errors');
+  return tab;
+});
+
 // ---------- run ----------
 const server = await startServer();
 const { brave, cdp } = await openBrowser();

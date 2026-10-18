@@ -18,7 +18,7 @@ The manager checks this address for new versions and updates the script by itsel
 |---|---|
 | **Alt+T** | Turn reading mode on/off (it starts off on every page) |
 | **ES → EN ⇄ ✕** at the top | Shown while reading mode is on (in the book reader, at the end of its top bar). **⇄** swaps the direction to English → Spanish and back. It's remembered: new tabs start with your last choice (Spanish → English until you first swap), while tabs already open keep theirs. **✕** turns reading mode off. It turns amber with a countdown while Google is busy |
-| **Alt+Shift+T** | The Lector panel, just under the direction pill (drag its header to move it; it reopens where you left it): <br>• **A quick translator** with its own direction, remembered separately (English → Spanish until you first swap). Type or paste, **Enter** translates (**Shift+Enter** for a new line). Click a word in the translation for the usual popup, back in the language you typed in. **⇄** swaps the direction and translates the translation back; **📋** copies it and **🔊** reads it aloud. It keeps its text until you close the tab <br>• **📖 PDF/EPUB** and **📝 Pasted text** open those readers in a new tab; **Reading: on/off** turns reading mode on/off <br>• **Continue reading**: your last books, each reopens in a new tab where you left off <br>It stays open while you read and click; **Esc**, **✕** or Alt+Shift+T close it |
+| **Alt+Shift+T** | The Lector panel, just under the direction pill (drag its header to move it; it reopens where you left it): <br>• **A quick translator** with its own direction, remembered separately (English → Spanish until you first swap). Type or paste, **Enter** translates (**Shift+Enter** for a new line). Click a word in the translation for the usual popup, back in the language you typed in. **⇄** swaps the direction and translates the translation back; **📋** copies it and **🔊** reads it aloud. It keeps its text until you close the tab <br>• **Word list**: words and phrases you saved with **+** on the popup, newest first, each with its translation, **🔊** and **✕**; **Clear all** empties it. It lasts until you close the tab (each site you visit in a tab keeps its own list) <br>• **📖 PDF/EPUB** and **📝 Pasted text** open those readers in a new tab; **Reading: on/off** turns reading mode on/off <br>• **Continue reading**: your last books, each reopens in a new tab where you left off <br>It stays open while you read and click; **Esc**, **✕** or Alt+Shift+T close it |
 | **Click a word** | Translate it in context |
 | **Drag across words** | Translate a phrase (the selection snaps to whole words) |
 | **Esc** | Close the popup (then the Lector panel) |
@@ -29,7 +29,7 @@ The manager checks this address for new versions and updates the script by itsel
 ### The popup
 
 ```
-pasamos · pasar                ◐ from phrase
+pasamos · pasar  🔊 +         ◐ from phrase
 we had a great time
 ──────────────────────
 phrase: pasamos genial
@@ -41,6 +41,7 @@ phrase: pasamos genial
 - **Dictionary form** next to the word (*pasamos · pasar*)
 - **▸ sentence** shows the original sentence above its translation, with the matching words highlighted
 - **🔊** reads the word or sentence aloud (Google's voice)
+- **+** saves the word (or phrase) to the panel's word list and turns into **✓**; click **✓** to take it off again
 - **SpanishDict ↗** opens the word in SpanishDict
 
 ## How the in-context translation works
