@@ -443,6 +443,26 @@ test('pasted-text reader: pill at top doesn\'t cover the paste box', async (cdp)
   return tab;
 });
 
+test('pasted-text reader: clicking a word while the paste box has focus keeps the scroll position', async (cdp) => {
+  const tab = await Tab.open(cdp, 'https://example.com/#lector-text');
+  await prep(tab);
+  await tab.type(Array.from({ length: 60 }, (_, i) => `Párrafo ${i}: me senté en el banco del parque.`).join('\n\n'));
+  await sleep(700);
+  eq(await tab.eval(`document.activeElement.className`), 'lector-paste', 'box still focused after typing');
+  await tab.eval('scrollTo(0, 2500)');
+  await sleep(200);
+  const p = await tab.eval(`(() => { const w = document.createTreeWalker(document.querySelector('.lector-text'), NodeFilter.SHOW_TEXT);
+    for (let n; (n = w.nextNode());) { const i = n.data.indexOf('banco'); if (i < 0) continue;
+      const r = document.createRange(); r.setStart(n, i); r.setEnd(n, i + 5); const b = r.getBoundingClientRect();
+      if (b.top > 250) return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; } })()`);
+  await tab.click(p.x, p.y);
+  await sleep(300);
+  assert(await tab.eval('__tipVisible()'), 'popup shows');
+  eq(await tab.eval('Math.round(scrollY)'), 2500, 'scroll position');
+  assert(await tab.eval(`document.activeElement !== document.querySelector('.lector-paste')`), 'focus left the paste box');
+  return tab;
+});
+
 // ---------- book reader ----------
 // The Brave Flatpak can only read some folders (e.g. /tmp), so the picker gets a copy there.
 function epubCopy() {

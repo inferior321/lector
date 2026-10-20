@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.10.0
+// @version      1.10.1
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode; Alt+Shift+T opens a quick translator.
 // @author       inferior321
 // @license      MIT
@@ -2313,6 +2313,11 @@
     const caret = caretAt(e.clientX, e.clientY);
     if (!caret) return;
     e.preventDefault(); // no native selection, no dragging links/images
+    // preventDefault also keeps the focus where it was, so move it out of a text field the way a
+    // normal click would: clearing the selection below while a field is focused makes the browser
+    // scroll to the field's caret (for the pasted-text reader's sticky box, the top of the page).
+    const focused = document.activeElement;
+    if (focused instanceof HTMLElement && isEditable(focused)) focused.blur();
     window.getSelection()?.removeAllRanges();
     drag = { x: e.clientX, y: e.clientY, caret, moved: false, range: null };
   }, true);
