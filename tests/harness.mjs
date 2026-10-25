@@ -1,5 +1,6 @@
 // Headless Brave + CDP harness for lector.user.js (needs Node 22+, the Brave Flatpak and openssl).
-// The userscript is injected after each page load together with GM_* stand-ins:
+// The userscript is injected after each page load (into the page and into every frame in it,
+// like the real manager; the script itself decides where it runs) together with GM_* stand-ins:
 // GM storage lives in a Node-side map (shared by all tabs, like the real manager), and
 // GM_xmlhttpRequest answers with a fake Google so tests are offline and deterministic.
 import { spawn } from 'node:child_process';
@@ -16,6 +17,10 @@ export const SCRIPT_PATH = process.env.LECTOR_SCRIPT || path.join(HERE, '..', 'l
 const PORT = 9341;
 const WEB_PORT = 8771;
 const TLS_PORT = 8772; // example.com (the reader tabs are https), self-signed certificate
+// https hosts answered by the local server: the reader tabs' example.com, a stand-in for a
+// Claude artifact frame, and some other site's frame
+const TLS_HOSTS = ['example.com', 'charla.frame.claudeusercontent.com', 'widget.other.test'];
+export const tlsUrl = (host, name) => `https://${host}/${name}`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -41,7 +46,7 @@ function throwawayCertificate() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lector-cert-'));
   const [key, cert] = [path.join(dir, 'key.pem'), path.join(dir, 'cert.pem')];
   execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '1',
-    '-subj', '/CN=example.com', '-addext', 'subjectAltName=DNS:example.com'], { stdio: 'ignore' });
+    '-subj', '/CN=example.com', '-addext', `subjectAltName=${TLS_HOSTS.map((h) => `DNS:${h}`).join(',')}`], { stdio: 'ignore' });
   const pair = { key: fs.readFileSync(key), cert: fs.readFileSync(cert) };
   fs.rmSync(dir, { recursive: true });
   return pair;
@@ -53,7 +58,9 @@ export async function launchBrave() {
   const profile = fs.mkdtempSync('/tmp/lector-brave-');
   const proc = spawn('flatpak', ['run', 'com.brave.Browser', '--headless=new', `--remote-debugging-port=${PORT}`,
     `--user-data-dir=${profile}`, '--no-first-run', '--window-size=1280,800',
-    `--host-resolver-rules=MAP example.com 127.0.0.1:${TLS_PORT}`, '--ignore-certificate-errors', 'about:blank'], { stdio: 'ignore', detached: true });
+    `--host-resolver-rules=${TLS_HOSTS.map((h) => `MAP ${h} 127.0.0.1:${TLS_PORT}`).join(',')}`, '--ignore-certificate-errors',
+    // frames from other sites stay in the page's process, so one CDP session reaches them
+    '--disable-site-isolation-trials', '--disable-features=IsolateOrigins,site-per-process', 'about:blank'], { stdio: 'ignore', detached: true });
   for (let i = 0; i < 40; i++) {
     try {
       const v = await (await fetch(`http://127.0.0.1:${PORT}/json/version`)).json();
@@ -155,6 +162,9 @@ export class Tab {
       }
       if (m.method === 'Runtime.exceptionThrown') tab.errors.push(m.params.exceptionDetails.exception?.description || m.params.exceptionDetails.text);
       if (m.method === 'Page.loadEventFired') tab.loaded = true;
+      if (m.method === 'Runtime.executionContextCreated') tab.contexts.push(m.params.context);
+      if (m.method === 'Runtime.executionContextDestroyed') tab.contexts = tab.contexts.filter((c) => c.id !== m.params.executionContextId);
+      if (m.method === 'Runtime.executionContextsCleared') tab.contexts = [];
     });
     if (url) await tab.goto(url);
     return tab;
@@ -180,14 +190,30 @@ export class Tab {
     await tab.inject();
     return tab;
   }
-  constructor(cdp, sessionId, targetId) { this.cdp = cdp; this.sessionId = sessionId; this.targetId = targetId; this.errors = []; this.loaded = false; }
+  constructor(cdp, sessionId, targetId) { this.cdp = cdp; this.sessionId = sessionId; this.targetId = targetId; this.errors = []; this.loaded = false; this.contexts = []; }
   send(method, params) { return this.cdp.send(method, params, this.sessionId); }
   async waitLoad() { for (let i = 0; i < 100 && !this.loaded; i++) await sleep(50); }
   async inject() {
     const src = fs.readFileSync(SCRIPT_PATH, 'utf8');
     const r = await this.send('Runtime.evaluate', { expression: `${shimSource()}\n${src}\n;'ok'` });
     if (r.exceptionDetails) throw new Error(`inject: ${r.exceptionDetails.exception?.description || r.exceptionDetails.text}`);
+    for (const c of this.frameContexts()) {
+      const f = await this.send('Runtime.evaluate', { expression: `${shimSource()}\n${src}\n;'ok'`, contextId: c.id });
+      if (f.exceptionDetails) throw new Error(`inject into ${c.origin}: ${f.exceptionDetails.exception?.description || f.exceptionDetails.text}`);
+    }
     await sleep(100);
+  }
+  // The main script context of each frame in the page (not the page itself).
+  frameContexts() {
+    return this.contexts.filter((c) => c.auxData?.isDefault && c.auxData.frameId !== this.targetId);
+  }
+  // Like eval, but inside the frame whose address contains `where`.
+  async frameEval(where, expr) {
+    const c = this.frameContexts().find((f) => f.origin.includes(where));
+    if (!c) throw new Error(`no frame at ${where}; frames: ${JSON.stringify(this.contexts.map((f) => [f.origin, f.auxData]))}`);
+    const r = await this.send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true, contextId: c.id });
+    if (r.exceptionDetails) throw new Error(`frame eval failed: ${expr.slice(0, 80)}: ${r.exceptionDetails.exception?.description || r.exceptionDetails.text}`);
+    return r.result.value;
   }
   async goto(url) { this.loaded = false; await this.send('Page.navigate', { url }); await this.waitLoad(); await this.inject(); }
   async reload() { this.loaded = false; await this.send('Page.reload'); await this.waitLoad(); await this.inject(); }

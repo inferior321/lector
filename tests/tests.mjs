@@ -636,6 +636,51 @@ test('no + on quick-translator popups, while loading, or on errors', async (cdp)
   return tab;
 });
 
+// ---------- embedded frames ----------
+// framed.html holds a stand-in for a Claude artifact (charla.frame.claudeusercontent.com, at the
+// top-left, so its coordinates match the page's) and a frame from another site below it.
+const ARTIFACT = 'claudeusercontent';
+async function openFramed(cdp) {
+  const tab = await openPage(cdp, 'framed.html');
+  for (const where of [ARTIFACT, 'other.test']) await tab.frameEval(where, HELPERS);
+  await tab.click(600, 450); // into the artifact (reading mode is off, so this just focuses it)
+  return tab;
+}
+
+test('Claude artifact frame: Lector runs there, and Alt+T and clicking a word work inside it', async (cdp) => {
+  const tab = await openFramed(cdp);
+  assert(await tab.frameEval(ARTIFACT, '!!__ui()'), 'Lector in the artifact frame');
+  assert(!(await tab.frameEval('other.test', '!!__ui()')), 'not in another site\'s frame');
+  await tab.key('t', { alt: true });
+  assert(await tab.frameEval(ARTIFACT, `__visible('.dirpill')`), 'reading mode on in the artifact');
+  assert(!(await tab.eval(`__visible('.dirpill')`)), 'the outer page stays off');
+  const p = await tab.frameEval(ARTIFACT, `__wordAt('pesas')`);
+  await tab.click(p.x, p.y);
+  await sleep(250);
+  assert(await tab.frameEval(ARTIFACT, '__tipVisible()'), 'popup in the artifact');
+  const r = await tab.frameEval(ARTIFACT, `__lastReq((r) => r.format === 'html')`);
+  eq([r.sl, r.tl], ['es', 'en'], 'lookup direction');
+  eq(await tab.frameEval(ARTIFACT, '__charlaClicks'), 0, 'the page\'s own tap-a-word stays quiet in reading mode');
+  return tab;
+});
+
+test('Claude artifact frame: the panel and word list work inside it; its menu says so', async (cdp) => {
+  const tab = await openFramed(cdp);
+  await tab.key('t', { alt: true });
+  const p = await tab.frameEval(ARTIFACT, `__wordAt('pesas')`);
+  await tab.click(p.x, p.y);
+  await sleep(250);
+  const s = await tab.frameEval(ARTIFACT, `__rect('.tip .save')`);
+  await tab.click(s.cx, s.cy);
+  await sleep(150);
+  await tab.key('t', { alt: true, shift: true });
+  assert(await tab.frameEval(ARTIFACT, `__visible('.qbox')`), 'panel in the artifact');
+  eq(await tab.frameEval(ARTIFACT, listWords), ['pesas'], 'word list');
+  const menu = await tab.frameEval(ARTIFACT, '__menu.map((m) => m.name)');
+  eq(menu, ['Toggle reading mode (this artifact)', 'Lector panel (this artifact)'], 'artifact menu');
+  return tab;
+});
+
 // ---------- run ----------
 const server = await startServer();
 const { brave, cdp } = await openBrowser();

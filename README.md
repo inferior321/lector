@@ -61,11 +61,12 @@ Google translates whole sentences, so Lector works out which part of the transla
 - Translations are cached in the userscript manager's storage, so repeat lookups are instant.
 - Your last 5 books are kept as files in the reader page's own browser storage (on this computer only), so they reopen without the file picker. Remove one with its ✕.
 - The book and text readers run on `example.com`, a plain page that doesn't block them. The PDF reader uses [PDF.js](https://mozilla.github.io/pdf.js/) (downloaded once from cdnjs and cached).
-- Doesn't work inside embedded frames, on text drawn as images (e.g. Google Docs), in scanned PDFs, or in copy-protected (DRM) ebooks such as Kindle books.
+- **Claude artifacts** (pages Claude makes, such as a practice page) show their content in an embedded frame, and Lector runs inside it with everything working there: Alt+T, the popup, the panel and its word list. Click inside the artifact once first so the shortcuts reach it (otherwise they go to the claude.ai page around it). Lector's entries in the userscript menu for it end in *(this artifact)*. While reading mode is on, the artifact's own click-a-word features don't get the click; Alt+T turns it off.
+- Doesn't work inside other embedded frames, on text drawn as images (e.g. Google Docs), in scanned PDFs, or in copy-protected (DRM) ebooks such as Kindle books.
 
 ## Tests
 
-`node tests/tests.mjs` runs the script in headless Brave (the Flatpak `com.brave.Browser`; needs Node 22+ and openssl) against a sample page, the text reader and a small EPUB, with Google faked so no network is needed. Add part of a test's name to run just those tests.
+`node tests/tests.mjs` runs the script in headless Brave (the Flatpak `com.brave.Browser`; needs Node 22+ and openssl) against a sample page, a page with embedded frames, the text reader and a small EPUB, with Google faked so no network is needed. Add part of a test's name to run just those tests.
 
 ## License
 
