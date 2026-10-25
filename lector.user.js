@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.10.1
+// @version      1.10.2
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode; Alt+Shift+T opens a quick translator.
 // @author       inferior321
 // @license      MIT
@@ -21,7 +21,19 @@
 
 (function () {
   'use strict';
-  if (window.top !== window.self) return; // skip iframes
+  if (window.top !== window.self) { // skip iframes
+    // TEMPORARY check: can Lector run inside Claude artifact frames? Shows a green box there.
+    const origins = [...(location.ancestorOrigins || [])];
+    if (/claude/.test(location.hostname) || origins.some((o) => /claude/.test(o))) {
+      const badge = document.createElement('div');
+      badge.textContent = `Lector ✓ in frame: ${location.origin} · depth ${origins.length} · ${location.href.slice(0, 60)}`;
+      badge.style.cssText = 'position:fixed;bottom:8px;left:8px;z-index:2147483647;background:#2e7d32;color:#fff;'
+        + 'font:12px system-ui,sans-serif;padding:4px 8px;border-radius:6px;cursor:pointer;';
+      badge.onclick = () => badge.remove();
+      (document.body || document.documentElement).append(badge);
+    }
+    return;
+  }
 
   // ---------- menu (registered first so it shows up even if a page breaks the UI code) ----------
   GM_registerMenuCommand('Toggle reading mode (Alt+T)', () => setEnabled(!enabled));
