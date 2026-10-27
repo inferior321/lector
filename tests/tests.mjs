@@ -639,45 +639,108 @@ test('no + on quick-translator popups, while loading, or on errors', async (cdp)
 // ---------- embedded frames ----------
 // framed.html holds a stand-in for a Claude artifact (charla.frame.claudeusercontent.com, at the
 // top-left, so its coordinates match the page's) and a frame from another site below it.
+// One Lector per tab: the top page has the only pill and panel, and reading mode, direction and
+// the word list are the same in every frame.
 const ARTIFACT = 'claudeusercontent';
-async function openFramed(cdp) {
-  const tab = await openPage(cdp, 'framed.html');
+async function openFramed(cdp, { focusFrame = true, skipTop = false, framesFirst = false } = {}) {
+  const tab = await Tab.open(cdp, pageUrl('framed.html'), { skipTop, framesFirst });
+  if (!skipTop) await prep(tab);
   for (const where of [ARTIFACT, 'other.test']) await tab.frameEval(where, HELPERS);
-  await tab.click(600, 450); // into the artifact (reading mode is off, so this just focuses it)
+  if (focusFrame) await tab.click(600, 450); // into the artifact (reading mode is off, so this just focuses it)
   return tab;
 }
+async function clickFrameWord(tab, word) {
+  const p = await tab.frameEval(ARTIFACT, `__wordAt(${JSON.stringify(word)})`);
+  await tab.click(p.x, p.y);
+  await sleep(250);
+}
 
-test('Claude artifact frame: Lector runs there, and Alt+T and clicking a word work inside it', async (cdp) => {
+test('frames: Lector runs in the artifact frame only, and adds no menu entries there', async (cdp) => {
   const tab = await openFramed(cdp);
   assert(await tab.frameEval(ARTIFACT, '!!__ui()'), 'Lector in the artifact frame');
   assert(!(await tab.frameEval('other.test', '!!__ui()')), 'not in another site\'s frame');
-  await tab.key('t', { alt: true });
-  assert(await tab.frameEval(ARTIFACT, `__visible('.dirpill')`), 'reading mode on in the artifact');
-  assert(!(await tab.eval(`__visible('.dirpill')`)), 'the outer page stays off');
-  const p = await tab.frameEval(ARTIFACT, `__wordAt('pesas')`);
-  await tab.click(p.x, p.y);
-  await sleep(250);
-  assert(await tab.frameEval(ARTIFACT, '__tipVisible()'), 'popup in the artifact');
-  const r = await tab.frameEval(ARTIFACT, `__lastReq((r) => r.format === 'html')`);
-  eq([r.sl, r.tl], ['es', 'en'], 'lookup direction');
-  eq(await tab.frameEval(ARTIFACT, '__charlaClicks'), 0, 'the page\'s own tap-a-word stays quiet in reading mode');
+  eq(await tab.frameEval(ARTIFACT, '__menu.length'), 0, 'no menu entries in the frame');
   return tab;
 });
 
-test('Claude artifact frame: the panel and word list work inside it; its menu says so', async (cdp) => {
+test('frames: Alt+T inside a frame turns reading mode on and off for the whole tab, one pill on top', async (cdp) => {
   const tab = await openFramed(cdp);
   await tab.key('t', { alt: true });
-  const p = await tab.frameEval(ARTIFACT, `__wordAt('pesas')`);
-  await tab.click(p.x, p.y);
-  await sleep(250);
+  assert(await tab.eval(`__visible('.dirpill')`), 'pill on the top page');
+  assert(!(await tab.frameEval(ARTIFACT, `__visible('.dirpill')`)), 'no pill in the frame');
+  await clickFrameWord(tab, 'pesas');
+  assert(await tab.frameEval(ARTIFACT, '__tipVisible()'), 'popup in the frame');
+  eq(await tab.frameEval(ARTIFACT, '__charlaClicks'), 0, 'the page\'s own click handler stays quiet in reading mode');
+  await tab.key('t', { alt: true });
+  assert(!(await tab.eval(`__visible('.dirpill')`)), 'pill gone');
+  assert(!(await tab.frameEval(ARTIFACT, '__tipVisible()')), 'frame popup closed');
+  await clickFrameWord(tab, 'cuarto');
+  assert(!(await tab.frameEval(ARTIFACT, '__tipVisible()')), 'reading mode off in the frame too');
+  eq(await tab.frameEval(ARTIFACT, '__charlaClicks'), 1, 'the page gets its click back');
+  return tab;
+});
+
+test('frames: Alt+T on the top page reaches the frame; the top pill\'s ⇄ and ✕ apply there too', async (cdp) => {
+  const tab = await openFramed(cdp, { focusFrame: false });
+  await tab.key('t', { alt: true });
+  await clickFrameWord(tab, 'pesas');
+  assert(await tab.frameEval(ARTIFACT, '__tipVisible()'), 'reading mode on in the frame');
+  eq(await tab.frameEval(ARTIFACT, `(({ sl, tl }) => [sl, tl])(__lastReq((r) => r.format === 'html'))`), ['es', 'en'], 'ES → EN');
+  const s = await tab.eval(`__rect('.dirswap')`);
+  await tab.click(s.cx, s.cy);
+  await sleep(150);
+  await clickFrameWord(tab, 'cuarto');
+  eq(await tab.frameEval(ARTIFACT, `(({ sl, tl }) => [sl, tl])(__lastReq((r) => r.format === 'html'))`), ['en', 'es'], 'swapped in the frame');
+  const x = await tab.eval(`__rect('.diroff')`);
+  await tab.click(x.cx, x.cy);
+  await sleep(150);
+  assert(!(await tab.frameEval(ARTIFACT, '__tipVisible()')), 'frame popup closed by ✕');
+  await clickFrameWord(tab, 'pesas');
+  assert(!(await tab.frameEval(ARTIFACT, '__tipVisible()')), 'reading mode off in the frame');
+  return tab;
+});
+
+test('frames: words saved in a frame go to the top page\'s panel; Alt+Shift+T in a frame opens it', async (cdp) => {
+  const tab = await openFramed(cdp);
+  await tab.key('t', { alt: true });
+  await clickFrameWord(tab, 'pesas');
   const s = await tab.frameEval(ARTIFACT, `__rect('.tip .save')`);
   await tab.click(s.cx, s.cy);
   await sleep(150);
+  eq(await tab.frameEval(ARTIFACT, `__q('.tip .save').textContent`), '✓', 'saved');
   await tab.key('t', { alt: true, shift: true });
-  assert(await tab.frameEval(ARTIFACT, `__visible('.qbox')`), 'panel in the artifact');
-  eq(await tab.frameEval(ARTIFACT, listWords), ['pesas'], 'word list');
-  const menu = await tab.frameEval(ARTIFACT, '__menu.map((m) => m.name)');
-  eq(menu, ['Toggle reading mode (this artifact)', 'Lector panel (this artifact)'], 'artifact menu');
+  await sleep(150);
+  assert(await tab.eval(`__visible('.qbox')`), 'panel on the top page');
+  assert(!(await tab.frameEval(ARTIFACT, `__visible('.qbox')`)), 'no panel in the frame');
+  eq(await tab.eval(listWords), ['pesas'], 'in the top page\'s list');
+  const r = await tab.eval(`__rect('.qwordremove')`);
+  await tab.click(r.cx, r.cy);
+  await sleep(150);
+  eq(await tab.frameEval(ARTIFACT, `__q('.tip .save').textContent`), '+', 'frame popup follows the panel\'s ✕');
+  await tab.key('Escape'); // focus is on the top page now: closes the panel
+  assert(!(await tab.eval(`__visible('.qbox')`)), 'panel closed');
+  return tab;
+});
+
+test('frames: a frame whose Lector started before the top page\'s still follows it', async (cdp) => {
+  const tab = await openFramed(cdp, { framesFirst: true });
+  await tab.key('t', { alt: true });
+  assert(await tab.eval(`__visible('.dirpill')`), 'pill on the top page');
+  assert(!(await tab.frameEval(ARTIFACT, `__visible('.dirpill')`)), 'no pill in the frame');
+  await clickFrameWord(tab, 'pesas');
+  assert(await tab.frameEval(ARTIFACT, '__tipVisible()'), 'popup in the frame');
+  return tab;
+});
+
+test('frames: with no Lector on the top page, the frame\'s Lector runs on its own', async (cdp) => {
+  const tab = await openFramed(cdp, { skipTop: true });
+  await sleep(600); // waits out the call to the top page
+  await tab.key('t', { alt: true });
+  assert(await tab.frameEval(ARTIFACT, `__visible('.dirpill')`), 'pill in the frame');
+  await clickFrameWord(tab, 'pesas');
+  assert(await tab.frameEval(ARTIFACT, '__tipVisible()'), 'popup in the frame');
+  await tab.key('t', { alt: true, shift: true });
+  assert(await tab.frameEval(ARTIFACT, `__visible('.qbox')`), 'panel in the frame');
   return tab;
 });
 

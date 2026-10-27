@@ -61,7 +61,7 @@ Google translates whole sentences, so Lector works out which part of the transla
 - Translations are cached in the userscript manager's storage, so repeat lookups are instant.
 - Your last 5 books are kept as files in the reader page's own browser storage (on this computer only), so they reopen without the file picker. Remove one with its ✕.
 - The book and text readers run on `example.com`, a plain page that doesn't block them. The PDF reader uses [PDF.js](https://mozilla.github.io/pdf.js/) (downloaded once from cdnjs and cached).
-- **Claude artifacts** (pages Claude makes, such as a practice page) show their content in an embedded frame, and Lector runs inside it with everything working there: Alt+T, the popup, the panel and its word list. Click inside the artifact once first so the shortcuts reach it (otherwise they go to the claude.ai page around it). Lector's entries in the userscript menu for it end in *(this artifact)*. While reading mode is on, the artifact's own click-a-word features don't get the click; Alt+T turns it off.
+- **Claude artifacts** (pages Claude makes, such as a practice page) show their content in an embedded frame, and Lector works inside it too. The tab still has one Lector: Alt+T and Alt+Shift+T work wherever you are, the pill and panel stay at the top of the window, and words you save inside the artifact land in the same word list. While reading mode is on, the artifact's own click-a-word features don't get the click; Alt+T turns it off.
 - Doesn't work inside other embedded frames, on text drawn as images (e.g. Google Docs), in scanned PDFs, or in copy-protected (DRM) ebooks such as Kindle books.
 
 ## Tests

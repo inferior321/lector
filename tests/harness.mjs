@@ -148,7 +148,9 @@ export function nextNewTab(cdp) {
 }
 
 export class Tab {
-  static async open(cdp, url) {
+  // skipTop: inject into the frames only, like a page whose top frame the manager can't reach;
+  // framesFirst: start the script in the frames before the page itself
+  static async open(cdp, url, { skipTop = false, framesFirst = false } = {}) {
     const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
     const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
     const tab = new Tab(cdp, sessionId, targetId);
@@ -166,6 +168,8 @@ export class Tab {
       if (m.method === 'Runtime.executionContextDestroyed') tab.contexts = tab.contexts.filter((c) => c.id !== m.params.executionContextId);
       if (m.method === 'Runtime.executionContextsCleared') tab.contexts = [];
     });
+    tab.skipTop = skipTop;
+    tab.framesFirst = framesFirst;
     if (url) await tab.goto(url);
     return tab;
   }
@@ -195,12 +199,14 @@ export class Tab {
   async waitLoad() { for (let i = 0; i < 100 && !this.loaded; i++) await sleep(50); }
   async inject() {
     const src = fs.readFileSync(SCRIPT_PATH, 'utf8');
-    const r = await this.send('Runtime.evaluate', { expression: `${shimSource()}\n${src}\n;'ok'` });
-    if (r.exceptionDetails) throw new Error(`inject: ${r.exceptionDetails.exception?.description || r.exceptionDetails.text}`);
-    for (const c of this.frameContexts()) {
-      const f = await this.send('Runtime.evaluate', { expression: `${shimSource()}\n${src}\n;'ok'`, contextId: c.id });
-      if (f.exceptionDetails) throw new Error(`inject into ${c.origin}: ${f.exceptionDetails.exception?.description || f.exceptionDetails.text}`);
-    }
+    const run = async (contextId, where) => {
+      const r = await this.send('Runtime.evaluate', { expression: `${shimSource()}\n${src}\n;'ok'`, contextId });
+      if (r.exceptionDetails) throw new Error(`inject into ${where}: ${r.exceptionDetails.exception?.description || r.exceptionDetails.text}`);
+    };
+    const top = async () => { if (!this.skipTop) await run(undefined, 'the page'); };
+    if (!this.framesFirst) await top();
+    for (const c of this.frameContexts()) await run(c.id, c.origin);
+    if (this.framesFirst) await top();
     await sleep(100);
   }
   // The main script context of each frame in the page (not the page itself).

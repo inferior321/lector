@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lector
 // @namespace    inferior321.lector
-// @version      1.11.0
+// @version      1.12.0
 // @description  A reading assistant for Spanish learners: in-context translations, phrase detection, audio, and readers for PDFs, EPUB books and pasted text. Alt+T toggles reading mode; Alt+Shift+T opens a quick translator.
 // @author       inferior321
 // @license      MIT
@@ -24,16 +24,15 @@
   // Embedded frames are skipped (ads, players, widgets…), except the ones whose text is worth
   // reading. Claude artifacts (e.g. a practice page) show their content in a frame on
   // <id>.frame.claudeusercontent.com, inside a claude.ai wrapper frame that stays skipped.
-  // Lector then runs in that frame on its own: its shortcuts work while the frame has the focus.
+  // The tab still has one Lector: see "one Lector per tab" below.
   const READABLE_FRAME_HOSTS = [/\.claudeusercontent\.com$/];
   const inFrame = window.top !== window.self;
   if (inFrame && !READABLE_FRAME_HOSTS.some((host) => host.test(location.hostname))) return;
+  let ledByTop = false; // in a frame: the top page's Lector is in charge
+  let topWords = [];    // in a frame led by the top page: its word list, as last sent
 
   // ---------- menu (registered first so it shows up even if a page breaks the UI code) ----------
-  if (inFrame) { // the outer page has its own Lector and menu entries, so say which one this is
-    GM_registerMenuCommand('Toggle reading mode (this artifact)', () => setEnabled(!enabled));
-    GM_registerMenuCommand('Lector panel (this artifact)', () => toggleQuickBox());
-  } else {
+  if (!inFrame) { // the top page's entries cover the whole tab
     GM_registerMenuCommand('Toggle reading mode (Alt+T)', () => setEnabled(!enabled));
     GM_registerMenuCommand('Lector panel (Alt+Shift+T)', () => toggleQuickBox());
     GM_registerMenuCommand('Open a PDF or EPUB to read…', () => (isReaderTab ? openBookReader() : openReaderTab(READER_URL)));
@@ -142,6 +141,7 @@
     }
     googlePausedUntil = Math.min(...GOOGLE_HOSTS.map((h) => h.pausedUntil)); // first one back
     updatePill();
+    if (ledByTop) tellTop('busy', { until: googlePausedUntil }); // the countdown shows on the top page's pill
     throw busyError();
   }
 
@@ -1084,9 +1084,10 @@
     enabled = on;
     if (on) markSeen();
     else { hideTip(); clearHover(); CSS.highlights?.delete('lector-seen'); }
-    pill.el.hidden = !on;
+    pill.el.hidden = !on || ledByTop;
     updatePill();
     showReadingButton();
+    tellFrames();
   }
 
   // ---------- direction pill ----------
@@ -1106,6 +1107,7 @@
       GM_setValue(PAGE_DIRECTION_KEY, tabReversed);
       hideTip();
       updatePill();
+      tellFrames();
     };
     const off = el('button', 'diroff', '✕');
     off.title = 'Turn reading mode off (Alt+T)';
@@ -1268,12 +1270,19 @@
   const wordKey = (w) => `${w.lang}:${w.text.toLowerCase()}`;
 
   function savedWords() {
+    if (ledByTop) return topWords;
     try { return JSON.parse(tabStore.get(WORDS_TAB_KEY)) || []; } catch { return []; }
   }
 
   function storeWords(words) {
-    tabStore.set(WORDS_TAB_KEY, JSON.stringify(words));
-    showWordList();
+    if (ledByTop) { // the list lives in the top page's panel
+      topWords = words;
+      tellTop('words', { words });
+    } else {
+      tabStore.set(WORDS_TAB_KEY, JSON.stringify(words));
+      showWordList();
+      tellFrames();
+    }
     tipEl.querySelector('.save')?.show(); // an open popup's +/✓ follows the panel's ✕ and Clear all
   }
 
@@ -1317,6 +1326,66 @@
       row.append(text, say, remove);
       return row;
     }));
+  }
+
+  // ---------- one Lector per tab ----------
+  // Lector can run in the top page and in readable frames inside it (READABLE_FRAME_HOSTS), but
+  // the tab behaves as one: the top page has the only pill and panel, and reading mode, the
+  // direction and the word list are the same in every frame. Shortcuts work wherever the focus
+  // is. A frame says hello to the top page; from the top page's first answer on, the frame
+  // follows it ('state' messages) and passes its shortcuts and word-list changes up to it.
+  // With no answer (the manager can't run Lector in the top page), the frame runs on its own.
+  const MSG = 'lector'; // marks our messages among the page's own
+  const followers = new Set(); // top page: the frames that said hello
+
+  function tellTop(type, extra = {}) { window.top.postMessage({ [MSG]: type, ...extra }, '*'); }
+
+  function tellFrames() {
+    if (inFrame) return;
+    const state = { [MSG]: 'state', enabled, reversed: tabReversed, words: savedWords() };
+    for (const frame of followers) frame.postMessage(state, '*');
+  }
+
+  // Is `win` one of the frames inside this page (at any depth)?
+  function isOurFrame(win) {
+    const inside = (w) => { for (let i = 0; i < w.frames.length; i++) if (w.frames[i] === win || inside(w.frames[i])) return true; return false; };
+    try { return inside(window); } catch { return false; }
+  }
+
+  function followTop({ enabled: on, reversed, words }) {
+    if (!ledByTop) { ledByTop = true; pill.el.hidden = true; closeQuickBox(); }
+    if (!!reversed !== tabReversed) { tabReversed = !!reversed; hideTip(); }
+    topWords = words;
+    tipEl.querySelector('.save')?.show();
+    if (!!on !== enabled) setEnabled(!!on);
+  }
+
+  const isWord = (w) => w && typeof w.text === 'string' && typeof w.lang === 'string';
+
+  window.addEventListener('message', (e) => {
+    const type = e.data?.[MSG];
+    if (!type) return;
+    if (inFrame) { // only the top page's Lector gives orders
+      if (e.source !== window.top) return;
+      if (type === 'hi') tellTop('hello');
+      else if (type === 'state' && Array.isArray(e.data.words)) followTop({ ...e.data, words: e.data.words.filter(isWord) });
+      return;
+    }
+    if (!isOurFrame(e.source)) return;
+    if (type === 'hello') { followers.add(e.source); tellFrames(); }
+    else if (type === 'toggle') setEnabled(!enabled);
+    else if (type === 'panel') toggleQuickBox();
+    else if (type === 'escape') { if (!tipEl.hidden) hideTip(); else if (!quick.box.hidden) closeQuickBox(); }
+    else if (type === 'words' && Array.isArray(e.data.words)) storeWords(e.data.words.filter(isWord));
+    else if (type === 'busy' && typeof e.data.until === 'number') { googlePausedUntil = Math.max(googlePausedUntil, e.data.until); updatePill(); }
+  });
+
+  // Whichever Lector starts first, they find each other: frames say hello, and the top page
+  // asks frames that started before it to say it again.
+  function linkTab() {
+    if (inFrame) { tellTop('hello'); return; }
+    const each = (w) => { for (let i = 0; i < w.frames.length; i++) { w.frames[i].postMessage({ [MSG]: 'hi' }, '*'); each(w.frames[i]); } };
+    try { each(window); } catch { /* a frame went away meanwhile */ }
   }
 
   // Reading mode button, the word list and the Continue reading list, as they are right now.
@@ -2423,14 +2492,17 @@
   document.addEventListener('keydown', (e) => {
     if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === HOTKEY) {
       e.preventDefault();
-      if (e.shiftKey) toggleQuickBox(); else setEnabled(!enabled);
+      if (ledByTop) tellTop(e.shiftKey ? 'panel' : 'toggle');
+      else if (e.shiftKey) toggleQuickBox(); else setEnabled(!enabled);
     } else if (e.key === 'Escape') {
       if (!tipEl.hidden) hideTip(); // a popup first, then the quick translator
+      else if (ledByTop) tellTop('escape');
       else if (!quick.box.hidden) closeQuickBox();
     }
   }, true);
 
   setEnabled(enabled);
+  linkTab();
   if (isReaderTab || isTextTab) restoreSeen();
   if (isReaderTab) openBookReader();
   if (isTextTab) openTextReader();
